@@ -1,24 +1,9 @@
 import { create } from "zustand";
 import { TimelineThumbnail } from "./timelineStore";
+import type { Overlay, VideoTrackKeyframe } from "../engine/types";
 
-export type OverlayKind = "score-home" | "score-away" | "text" | "image";
-
-export interface OverlayItem {
-  id: string;
-  type: OverlayKind;
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  zIndex: number;
-  text?: string;
-  fontFamily?: string;
-  fontSize?: number;
-  color?: string;
-  imageSrc?: string;
-  visible: boolean;
-  locked?: boolean;
-}
+export type { Overlay };
+export type OverlayKind = Overlay["type"];
 
 export interface MediaClip {
   id: string;
@@ -35,10 +20,10 @@ export interface MediaClip {
 
 type OverlayShiftDirection = "forward" | "backward";
 
-const resolveZIndex = (overlay: OverlayItem, fallback: number) =>
+const resolveZIndex = (overlay: Overlay, fallback: number) =>
   typeof overlay.zIndex === "number" ? overlay.zIndex : fallback;
 
-const nextZIndex = (overlays: OverlayItem[]) => {
+const nextZIndex = (overlays: Overlay[]) => {
   if (overlays.length === 0) return 1;
   return (
     overlays.reduce(
@@ -49,7 +34,7 @@ const nextZIndex = (overlays: OverlayItem[]) => {
 };
 
 const shiftOverlayOrder = (
-  overlays: OverlayItem[],
+  overlays: Overlay[],
   selectedIds: string[],
   direction: OverlayShiftDirection
 ) => {
@@ -109,7 +94,8 @@ interface VideoState {
   zoomPercent: number;
   panOffset: { x: number; y: number };
   keyframeMode: boolean;
-  overlays: OverlayItem[];
+  overlays: Overlay[];
+  videoTrackKeyframes: VideoTrackKeyframe[];
   selectedOverlayIds: string[];
   showScoreboardOverlay: boolean;
   setVideoSrc: (src: string | null) => void;
@@ -125,9 +111,9 @@ interface VideoState {
   setPanOffset: (offset: { x: number; y: number }) => void;
   resetTransform: () => void;
   toggleKeyframeMode: () => void;
-  addTextOverlay: (overlay?: Partial<OverlayItem>) => string;
-  addImageOverlay: (imageSrc: string, overlay?: Partial<OverlayItem>) => string;
-  updateOverlay: (id: string, patch: Partial<OverlayItem>) => void;
+  addTextOverlay: (overlay?: Partial<Overlay>) => string;
+  addImageOverlay: (imageSrc: string, overlay?: Partial<Overlay>) => string;
+  updateOverlay: (id: string, patch: Partial<Overlay>) => void;
   setOverlayVisibility: (id: string, visible: boolean) => void;
   setOverlayPosition: (id: string, x: number, y: number) => void;
   setOverlayDimensions: (id: string, width: number, height: number) => void;
@@ -136,6 +122,8 @@ interface VideoState {
   clearOverlaySelection: () => void;
   bringSelectionForward: () => void;
   sendSelectionBackward: () => void;
+  setVideoTrackKeyframes: (kfs: VideoTrackKeyframe[]) => void;
+  addVideoTrackKeyframe: (kf: VideoTrackKeyframe) => void;
   toggleScoreboardOverlay: (visible: boolean) => void;
 }
 
@@ -158,33 +146,38 @@ export const useVideoStore = create<VideoState>((set, get) => ({
   overlays: [
     {
       id: "score-home",
-      type: "score-home",
-      text: "0",
-      x: 40,
-      y: 40,
-      width: 180,
-      height: 54,
+      type: "scoreboard",
       zIndex: 1,
+      startTime: 0,
+      endTime: Infinity,
+      base: { x: 40, y: 40, width: 180, height: 54 },
+      keyframes: [],
+      text: "HOME",
       fontFamily: "Inter, sans-serif",
       fontSize: 32,
       color: "#ffffff",
       visible: true,
+      locked: true,
+      dynamic: { type: "scoreboard" },
     },
     {
       id: "score-away",
-      type: "score-away",
-      text: "0",
-      x: 220,
-      y: 40,
-      width: 180,
-      height: 54,
+      type: "scoreboard",
       zIndex: 2,
+      startTime: 0,
+      endTime: Infinity,
+      base: { x: 220, y: 40, width: 180, height: 54 },
+      keyframes: [],
+      text: "AWAY",
       fontFamily: "Inter, sans-serif",
       fontSize: 32,
       color: "#ffffff",
       visible: true,
+      locked: true,
+      dynamic: { type: "scoreboard" },
     },
   ],
+  videoTrackKeyframes: [],
   selectedOverlayIds: [],
   showScoreboardOverlay: true,
   setVideoSrc: (src) => set({ videoSrc: src }),
@@ -246,15 +239,15 @@ export const useVideoStore = create<VideoState>((set, get) => ({
     })),
   addTextOverlay: (overlay) => {
     const id = createOverlayId();
-    const next: OverlayItem = {
+    const next: Overlay = {
       id,
       type: overlay?.type ?? "text",
-      text: overlay?.text ?? "New Text",
-      x: overlay?.x ?? 80,
-      y: overlay?.y ?? 120,
-      width: overlay?.width ?? 240,
-      height: overlay?.height ?? 80,
       zIndex: overlay?.zIndex ?? nextZIndex(get().overlays),
+      startTime: overlay?.startTime ?? 0,
+      endTime: overlay?.endTime ?? Infinity,
+      base: overlay?.base ?? { x: 80, y: 120, width: 240, height: 80 },
+      keyframes: overlay?.keyframes ?? [],
+      text: overlay?.text ?? "New Text",
       fontFamily: overlay?.fontFamily ?? "Inter, sans-serif",
       fontSize: overlay?.fontSize ?? 24,
       color: overlay?.color ?? "#ffffff",
@@ -268,15 +261,15 @@ export const useVideoStore = create<VideoState>((set, get) => ({
   },
   addImageOverlay: (imageSrc, overlay) => {
     const id = createOverlayId();
-    const next: OverlayItem = {
+    const next: Overlay = {
       id,
       type: "image",
-      imageSrc,
-      x: overlay?.x ?? 120,
-      y: overlay?.y ?? 140,
-      width: overlay?.width ?? 320,
-      height: overlay?.height ?? 180,
       zIndex: overlay?.zIndex ?? nextZIndex(get().overlays),
+      startTime: overlay?.startTime ?? 0,
+      endTime: overlay?.endTime ?? Infinity,
+      base: overlay?.base ?? { x: 120, y: 140, width: 320, height: 180 },
+      keyframes: overlay?.keyframes ?? [],
+      imageSrc,
       visible: overlay?.visible ?? true,
     };
     set((state) => ({
@@ -300,19 +293,23 @@ export const useVideoStore = create<VideoState>((set, get) => ({
   setOverlayPosition: (id, x, y) =>
     set((state) => ({
       overlays: state.overlays.map((overlay) =>
-        overlay.id === id ? { ...overlay, x, y } : overlay
+        overlay.id === id
+          ? { ...overlay, base: { ...overlay.base, x, y } }
+          : overlay
       ),
     })),
   setOverlayDimensions: (id, width, height) =>
     set((state) => ({
       overlays: state.overlays.map((overlay) =>
-        overlay.id === id ? { ...overlay, width, height } : overlay
+        overlay.id === id
+          ? { ...overlay, base: { ...overlay.base, width, height } }
+          : overlay
       ),
     })),
   removeOverlays: (ids) =>
     set((state) => ({
       overlays: state.overlays.filter((overlay) => {
-        const isScoreboard = overlay.type === "score-home" || overlay.type === "score-away";
+        const isScoreboard = overlay.type === "scoreboard";
         if (isScoreboard) return true;
         if (overlay.locked) return true;
         return !ids.includes(overlay.id);
@@ -338,6 +335,21 @@ export const useVideoStore = create<VideoState>((set, get) => ({
       });
       const next = shiftOverlayOrder(state.overlays, movableIds, "backward");
       return next === state.overlays ? {} : { overlays: next };
+    }),
+  setVideoTrackKeyframes: (kfs) => set({ videoTrackKeyframes: kfs }),
+  addVideoTrackKeyframe: (kf) =>
+    set((state) => {
+      const idx = state.videoTrackKeyframes.findIndex(
+        (k) => Math.abs(k.time - kf.time) < 0.001,
+      );
+      if (idx >= 0) {
+        const next = [...state.videoTrackKeyframes];
+        next[idx] = { ...next[idx], ...kf };
+        return { videoTrackKeyframes: next };
+      }
+      return {
+        videoTrackKeyframes: [...state.videoTrackKeyframes, kf],
+      };
     }),
   toggleScoreboardOverlay: (visible) => set({ showScoreboardOverlay: visible }),
 }));

@@ -1,7 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { ClipRange } from "../store/types";
-import { runFfmpeg, type FfmpegProgressPayload } from "./FfmpegService";
-import { createOverlayCompositeFile } from "./OverlayExportService";
+import { useVideoStore } from "../store/videoStore";
+import { useAppStore } from "../store/appStore";
+import { deriveScoreEvents } from "../engine/scoreEvents";
+import { exportWithFrames } from "../engine/FrameExporter";
+import type { TimelineModel } from "../engine/types";
 
 interface ExportProgressUpdate {
   percent: number;
@@ -12,57 +15,26 @@ interface ExportOptions {
   onProgress?: (update: ExportProgressUpdate) => void;
 }
 
-const createProgressHandler = (
-  clips: ClipRange[],
-  cb?: (update: ExportProgressUpdate) => void
-) => {
-  if (!cb) return undefined;
-  const totalSeconds = clips.reduce(
-    (sum, clip) => sum + Math.max(0, clip.end_time - clip.start_time),
-    0
+function buildTimelineModel(): TimelineModel {
+  const videoState = useVideoStore.getState();
+  const appState = useAppStore.getState();
+  const scoreEvents = deriveScoreEvents(
+    appState.plays,
+    appState.opponentScoreEvents,
   );
-  const totalMicros = Math.max(totalSeconds, 0.0001) * 1_000_000;
-  let lastPercent = 0;
 
-  return (payload: FfmpegProgressPayload) => {
-    if (payload.key === "out_time_ms") {
-      const micros = Number(payload.value);
-      if (!Number.isFinite(micros)) return;
-      const percent = Math.max(0, Math.min(100, (micros / totalMicros) * 100));
-      lastPercent = percent;
-      cb({
-        percent,
-        status: `Encoding ${(micros / 1_000_000).toFixed(1)}s of ${totalSeconds.toFixed(1)}s`,
-      });
-      return;
-    }
-    if (payload.key === "progress" && payload.value === "end") {
-      cb({ percent: 100, status: "Finalizing export..." });
-      return;
-    }
-    if (payload.key === "frame") {
-      cb({ percent: lastPercent, status: `Frame ${payload.value}` });
-    }
+  return {
+    duration: videoState.duration,
+    currentTime: 0,
+    overlays: videoState.showScoreboardOverlay ? videoState.overlays : [],
+    scoreEvents: videoState.showScoreboardOverlay ? scoreEvents : [],
+    videoTrack: { keyframes: videoState.videoTrackKeyframes },
   };
-};
+}
 
 export class ExportService {
   static async ensureExportsDir(): Promise<string> {
     return invoke<string>("ensure_exports_dir");
-  }
-
-  static async generateFfmpegArgs(
-    videoPath: string,
-    clips: ClipRange[],
-    outputPath: string,
-    overlayPath?: string | null
-  ): Promise<string[]> {
-    return invoke<string[]>("generate_ffmpeg_concat", {
-      videoPath,
-      clips,
-      outputPath,
-      overlayPath: overlayPath ?? null,
-    });
   }
 
   static async exportFull(
@@ -74,25 +46,25 @@ export class ExportService {
     if (!outputPath) {
       throw new Error("An output path is required for export");
     }
-    const sortedClips = [...clips].sort((a, b) => a.start_time - b.start_time);
-    const overlayAsset = await createOverlayCompositeFile();
-    try {
-      const args = await this.generateFfmpegArgs(
-        videoPath,
-        sortedClips,
-        outputPath,
-        overlayAsset?.path
-      );
 
-      options?.onProgress?.({ percent: 0, status: "Preparing export..." });
-      await runFfmpeg(args, {
-        onProgress: createProgressHandler(sortedClips, options?.onProgress),
-      });
-    } finally {
-      await overlayAsset?.cleanup();
+    const videoState = useVideoStore.getState();
+    if (!videoState.videoSrc) {
+      throw new Error("No video loaded");
     }
 
-    return outputPath;
+    const sortedClips = [...clips].sort((a, b) => a.start_time - b.start_time);
+    const timelineModel = buildTimelineModel();
+
+    return exportWithFrames({
+      videoSrc: videoState.videoSrc,
+      videoPath,
+      clips: sortedClips,
+      timelineModel,
+      outputPath,
+      onProgress: options?.onProgress
+        ? (pct, status) => options.onProgress!({ percent: pct, status })
+        : undefined,
+    });
   }
 
   static async exportHighlights(
@@ -106,24 +78,23 @@ export class ExportService {
     const typesLabel = statTypes.join("_");
     const outputPath = `${exportDir}\\highlights_${typesLabel}_${timestamp}.mp4`;
 
-    const sortedClips = [...clips].sort((a, b) => a.start_time - b.start_time);
-    const overlayAsset = await createOverlayCompositeFile();
-    try {
-      const args = await this.generateFfmpegArgs(
-        videoPath,
-        sortedClips,
-        outputPath,
-        overlayAsset?.path
-      );
-
-      options?.onProgress?.({ percent: 0, status: "Preparing highlights..." });
-      await runFfmpeg(args, {
-        onProgress: createProgressHandler(sortedClips, options?.onProgress),
-      });
-    } finally {
-      await overlayAsset?.cleanup();
+    const videoState = useVideoStore.getState();
+    if (!videoState.videoSrc) {
+      throw new Error("No video loaded");
     }
 
-    return outputPath;
+    const sortedClips = [...clips].sort((a, b) => a.start_time - b.start_time);
+    const timelineModel = buildTimelineModel();
+
+    return exportWithFrames({
+      videoSrc: videoState.videoSrc,
+      videoPath,
+      clips: sortedClips,
+      timelineModel,
+      outputPath,
+      onProgress: options?.onProgress
+        ? (pct, status) => options.onProgress!({ percent: pct, status })
+        : undefined,
+    });
   }
 }

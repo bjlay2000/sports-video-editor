@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useAppStore } from "../../store/appStore";
 import { useVideoStore } from "../../store/videoStore";
 import { StatType } from "../../store/types";
@@ -109,61 +109,8 @@ export function ScoringPanel() {
   const setVideoTime = useVideoStore((s) => s.setCurrentTime);
   const showScoreboardOverlay = useVideoStore((s) => s.showScoreboardOverlay);
   const toggleScoreboardOverlay = useVideoStore((s) => s.toggleScoreboardOverlay);
-  const updateOverlay = useVideoStore((s) => s.updateOverlay);
   const setPlayheadTime = useTimelineStore((s) => s.setPlayheadTime);
   const [showStatsDrawer, setShowStatsDrawer] = useState(false);
-
-  type ScoreEvent = { time: number; score: number };
-
-  const homeScoreTimeline = useMemo<ScoreEvent[]>(() => {
-    const scoringPlays = plays
-      .filter((play) => SCORING_TYPES.has(play.event_type as StatType))
-      .sort((a, b) => a.timestamp - b.timestamp);
-
-    let running = 0;
-    const timeline: ScoreEvent[] = [{ time: 0, score: 0 }];
-    scoringPlays.forEach((play) => {
-      const key = play.event_type as ShotKey;
-      running += SHOT_POINT_MAP[key] ?? 0;
-      timeline.push({ time: play.timestamp, score: running });
-    });
-    return timeline;
-  }, [plays]);
-
-  const opponentTimeline = useMemo<ScoreEvent[]>(() => {
-    if (opponentScoreEvents.length === 0) {
-      return [{ time: 0, score: 0 }];
-    }
-    return [...opponentScoreEvents].sort((a, b) => a.time - b.time);
-  }, [opponentScoreEvents]);
-
-  const getScoreAtTime = useCallback((timeline: ScoreEvent[], time: number) => {
-    if (timeline.length === 0) return 0;
-    let latest = timeline[0].score;
-    for (const event of timeline) {
-      if (time + 0.0001 >= event.time) {
-        latest = event.score;
-      } else {
-        break;
-      }
-    }
-    return latest;
-  }, []);
-
-  const derivedHomeScore = useMemo(
-    () => getScoreAtTime(homeScoreTimeline, currentTime),
-    [homeScoreTimeline, currentTime, getScoreAtTime]
-  );
-
-  const derivedAwayScore = useMemo(
-    () => getScoreAtTime(opponentTimeline, currentTime),
-    [opponentTimeline, currentTime, getScoreAtTime]
-  );
-
-  useEffect(() => {
-    updateOverlay("score-home", { text: String(derivedHomeScore) });
-    updateOverlay("score-away", { text: String(derivedAwayScore) });
-  }, [derivedHomeScore, derivedAwayScore, updateOverlay]);
 
   const handleStatClick = (statType: StatType) => {
     if (!videoSrc) return;
