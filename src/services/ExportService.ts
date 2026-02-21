@@ -70,13 +70,12 @@ export class ExportService {
   static async exportHighlights(
     videoPath: string,
     clips: ClipRange[],
-    statTypes: string[],
+    outputPath: string,
     options?: ExportOptions
   ): Promise<string> {
-    const exportDir = await this.ensureExportsDir();
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const typesLabel = statTypes.join("_");
-    const outputPath = `${exportDir}\\highlights_${typesLabel}_${timestamp}.mp4`;
+    if (!outputPath) {
+      throw new Error("An output path is required for highlight export");
+    }
 
     const videoState = useVideoStore.getState();
     if (!videoState.videoSrc) {

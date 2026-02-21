@@ -1,4 +1,4 @@
-import { appCacheDir, join } from "@tauri-apps/api/path";
+import { appDataDir, join } from "@tauri-apps/api/path";
 import { exists, mkdir, remove, writeFile } from "@tauri-apps/plugin-fs";
 import { getRenderState } from "./RenderEngine";
 import { renderFrame } from "./CanvasCompositor";
@@ -137,7 +137,7 @@ export async function exportWithFrames(
   const exportVideo = await createVideoElement(videoSrc);
 
   // Create temp directory for frame images
-  const root = await appCacheDir();
+  const root = await appDataDir();
   const sessionId = `export-${Date.now()}`;
   const sessionDir = await join(root, FRAME_CACHE_DIR, sessionId);
   await ensureDir(sessionDir);

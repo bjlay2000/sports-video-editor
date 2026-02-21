@@ -14,7 +14,6 @@ import { TimelineRenderer } from "./TimelineRenderer";
 import { useTimelineStore } from "../../store/timelineStore";
 import { useVideoStore } from "../../store/videoStore";
 import { useAppStore } from "../../store/appStore";
-import { useToastStore } from "../../store/toastStore";
 import { videoEngine } from "../../services/VideoEngine";
 import type { TimelineMarker } from "../../store/types";
 import { PlayCoordinator } from "../../services/PlayCoordinator";
@@ -49,8 +48,6 @@ const formatMarkerLabel = (eventType: string) => {
       return eventType;
   }
 };
-
-const SCOREBOARD_OVERLAY_IDS = new Set(["score-home", "score-away"]);
 
 export function TimelinePanel() {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -95,7 +92,6 @@ export function TimelinePanel() {
   const updateOverlay = useVideoStore((s) => s.updateOverlay);
   const overlaySelection = useVideoStore((s) => s.selectedOverlayIds);
   const removeOverlays = useVideoStore((s) => s.removeOverlays);
-  const clearOverlaySelectionStore = useVideoStore((s) => s.clearOverlaySelection);
   const bringSelectionForward = useVideoStore((s) => s.bringSelectionForward);
   const sendSelectionBackward = useVideoStore((s) => s.sendSelectionBackward);
   const hasOverlaySelection = overlaySelection.length > 0;
@@ -104,7 +100,6 @@ export function TimelinePanel() {
   const removeMarker = useAppStore((s) => s.removeMarker);
   const removeMarkersByIds = useAppStore((s) => s.removeMarkersByIds);
   const updateMarker = useAppStore((s) => s.updateMarker);
-  const pushToast = useToastStore((s) => s.pushToast);
 
   useEffect(() => {
     const observer = new ResizeObserver((entries) => {
@@ -353,12 +348,9 @@ export function TimelinePanel() {
     .slice(0, 8);
 
   const handleDeleteSelected = async () => {
-    const removableOverlays = overlaySelection.filter((id) => !SCOREBOARD_OVERLAY_IDS.has(id));
-    if (removableOverlays.length > 0) {
-      removeOverlays(removableOverlays);
-      clearOverlaySelectionStore();
-    } else if (overlaySelection.length > 0) {
-      pushToast("Scoreboard elements cannot be deleted", "info");
+    if (overlaySelection.length > 0) {
+      console.log("[delete] about to remove, selectedOverlayIds:", overlaySelection);
+      removeOverlays(overlaySelection);
     }
     if (selectedMarkerIds.length === 0) return;
     const selected = markers.filter((marker) => selectedMarkerIds.includes(marker.id));

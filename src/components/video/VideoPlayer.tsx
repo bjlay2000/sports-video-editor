@@ -58,6 +58,8 @@ export function VideoPlayer() {
   const plays = useAppStore((s) => s.plays);
   const opponentScoreEvents = useAppStore((s) => s.opponentScoreEvents);
   const duration = useVideoStore((s) => s.duration);
+  const videoWidth = useVideoStore((s) => s.videoWidth);
+  const videoHeight = useVideoStore((s) => s.videoHeight);
   const videoTrackKeyframes = useVideoStore((s) => s.videoTrackKeyframes);
   const [isDropping, setIsDropping] = useState(false);
   const [imageVersion, setImageVersion] = useState(0);
@@ -129,7 +131,14 @@ export function VideoPlayer() {
     const handleGlobalPointerDown = (event: PointerEvent) => {
       const target = event.target as HTMLElement | null;
       if (!target) return;
-      if (target.closest("[data-overlay-node]") || target.closest("[data-video-stage]")) {
+      // Don't clear selection when clicking overlay nodes, the video stage,
+      // or any button / interactive element outside the video area (e.g. toolbar delete)
+      if (
+        target.closest("[data-overlay-node]") ||
+        target.closest("[data-video-stage]") ||
+        target.closest("[data-timeline-controls]") ||
+        target.closest("button")
+      ) {
         return;
       }
       if (selectedIdsRef.current.length > 0) {
@@ -280,23 +289,18 @@ export function VideoPlayer() {
 
   const renderableOverlays = renderState.overlays;
 
-  // Canvas resize observer
+  // Sync canvas resolution to video native dimensions
   useEffect(() => {
     const canvas = overlayCanvasRef.current;
-    if (!canvas) return;
-    const observer = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        const w = Math.floor(entry.contentRect.width);
-        const h = Math.floor(entry.contentRect.height);
-        if (canvas.width !== w || canvas.height !== h) {
-          canvas.width = w;
-          canvas.height = h;
-        }
-      }
-    });
-    observer.observe(canvas);
-    return () => observer.disconnect();
-  }, []);
+    if (!canvas || videoWidth === 0 || videoHeight === 0) return;
+    if (canvas.width !== videoWidth || canvas.height !== videoHeight) {
+      canvas.width = videoWidth;
+      canvas.height = videoHeight;
+    }
+    // CSS sizing fills the container; resolution matches the video
+    canvas.style.width = "100%";
+    canvas.style.height = "100%";
+  }, [videoWidth, videoHeight]);
 
   // Canvas overlay rendering
   useEffect(() => {
@@ -321,7 +325,7 @@ export function VideoPlayer() {
     event: ReactPointerEvent<HTMLDivElement>,
     overlay: ComputedOverlay
   ) => {
-    if (overlay.locked || event.button !== 0) return;
+    if (event.button !== 0) return;
     event.stopPropagation();
     event.preventDefault();
     handleSelectOverlay(overlay.id, event.metaKey || event.ctrlKey || event.shiftKey);
@@ -330,26 +334,34 @@ export function VideoPlayer() {
       pointerId: event.pointerId,
       startX: event.clientX,
       startY: event.clientY,
-      originX: overlay.x,
-      originY: overlay.y,
+      originX: overlay.x,  // video pixel space
+      originY: overlay.y,  // video pixel space
     };
     event.currentTarget.setPointerCapture(event.pointerId);
   };
 
   const handleOverlayPointerMove = (event: ReactPointerEvent<HTMLElement>) => {
+    // Compute DOM→video pixel scale from the canvas element (which fills the container
+    // via inset-0 and has internal resolution = videoWidth × videoHeight).
+    const canvas = overlayCanvasRef.current;
+    const cw = canvas?.clientWidth || 1;
+    const ch = canvas?.clientHeight || 1;
+    const scaleX = videoWidth / cw;
+    const scaleY = videoHeight / ch;
+
     const dragSession = overlayDragRef.current;
     if (dragSession && dragSession.pointerId === event.pointerId) {
       event.preventDefault();
-      const dx = (event.clientX - dragSession.startX) / scale;
-      const dy = (event.clientY - dragSession.startY) / scale;
+      const dx = (event.clientX - dragSession.startX) * scaleX;
+      const dy = (event.clientY - dragSession.startY) * scaleY;
       setOverlayPosition(dragSession.id, dragSession.originX + dx, dragSession.originY + dy);
       return;
     }
     const resizeSession = overlayResizeRef.current;
     if (resizeSession && resizeSession.pointerId === event.pointerId) {
       event.preventDefault();
-      const dx = (event.clientX - resizeSession.startX) / scale;
-      const dy = (event.clientY - resizeSession.startY) / scale;
+      const dx = (event.clientX - resizeSession.startX) * scaleX;
+      const dy = (event.clientY - resizeSession.startY) * scaleY;
       const minSize = 40;
       let nextWidth = resizeSession.originWidth;
       let nextHeight = resizeSession.originHeight;
@@ -407,7 +419,6 @@ export function VideoPlayer() {
     overlay: ComputedOverlay,
     edge: "n" | "s" | "e" | "w" | "ne" | "nw" | "se" | "sw"
   ) => {
-    if (overlay.locked) return;
     event.stopPropagation();
     event.preventDefault();
     if (!selectedOverlayIds.includes(overlay.id)) {
@@ -485,6 +496,8 @@ export function VideoPlayer() {
             ref={videoRef}
             className={`max-w-none max-h-none ${!videoSrc ? "hidden" : ""}`}
             style={{
+              position: "relative",
+              zIndex: 0,
               transform: videoTransform,
               transformOrigin: "50% 50%",
               transition: dragState.current ? "none" : "transform 0.08s ease-out",
@@ -501,6 +514,7 @@ export function VideoPlayer() {
               ref={overlayCanvasRef}
               className="absolute inset-0 pointer-events-none"
               style={{
+                zIndex: 10,
                 transform: overlayTransform,
                 transition: dragState.current ? "none" : "transform 0.08s ease-out",
                 transformOrigin: "50% 50%",
@@ -511,6 +525,7 @@ export function VideoPlayer() {
             <div
               className="absolute inset-0 pointer-events-none"
               style={{
+                zIndex: 20,
                 transform: overlayTransform,
                 transition: dragState.current ? "none" : "transform 0.08s ease-out",
                 transformOrigin: "50% 50%",
@@ -518,16 +533,14 @@ export function VideoPlayer() {
             >
               {renderableOverlays.map((overlay) => {
                   const isSelected = selectedOverlayIds.includes(overlay.id);
-                  const isLocked = Boolean(overlay.locked);
+                  const isScoreboard = overlay.type === "scoreboard";
                   const handleMessage =
                     overlay.type === "text"
                       ? "Drag to reposition. Double-click to edit."
                       : overlay.type === "image"
                         ? "Drag to reposition. Use handles to resize."
-                        : "Scoreboard overlay";
-                  const commonHandlers = isLocked
-                    ? {}
-                    : {
+                        : "Scoreboard overlay (drag to reposition)";
+                  const commonHandlers = {
                         onPointerDown: (event: ReactPointerEvent<HTMLDivElement>) =>
                           handleOverlayPointerDown(event, overlay),
                         onPointerMove: handleOverlayPointerMove,
@@ -536,24 +549,30 @@ export function VideoPlayer() {
                         onDoubleClick: () => handleOverlayDoubleClick(overlay),
                       };
 
+                  // Convert video-pixel coords → percentage of container
+                  // (canvas fills container via inset-0 and maps its internal
+                  //  videoWidth×videoHeight to that same area)
+                  const pctX = videoWidth  > 0 ? (overlay.x / videoWidth) * 100 : 0;
+                  const pctY = videoHeight > 0 ? (overlay.y / videoHeight) * 100 : 0;
+                  const pctW = videoWidth  > 0 ? (overlay.width / videoWidth) * 100 : 0;
+                  const pctH = videoHeight > 0 ? (overlay.height / videoHeight) * 100 : 0;
+
                   return (
                     <div
                       key={overlay.id}
                       data-overlay-node
-                      className={`absolute select-none ${
-                        isLocked ? "pointer-events-none" : "pointer-events-auto cursor-move"
-                      }`}
+                      className="absolute select-none pointer-events-auto cursor-move"
                       style={{
-                        left: overlay.x,
-                        top: overlay.y,
-                        width: overlay.width,
-                        height: overlay.height,
+                        left: `${pctX}%`,
+                        top: `${pctY}%`,
+                        width: `${pctW}%`,
+                        height: `${pctH}%`,
                         zIndex: overlay.zIndex,
                       }}
                       title={handleMessage}
                       {...commonHandlers}
                     >
-                      {isSelected && !isLocked && (
+                      {isSelected && !isScoreboard && (
                         <>
                           {RESIZE_HANDLES.map(({ edge, cursor, style }) => (
                             <button

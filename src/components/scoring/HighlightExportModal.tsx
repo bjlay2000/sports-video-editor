@@ -5,6 +5,7 @@ import { useToastStore } from "../../store/toastStore";
 import { DatabaseService } from "../../services/DatabaseService";
 import { ExportService } from "../../services/ExportService";
 import { StatType } from "../../store/types";
+import { save } from "@tauri-apps/plugin-dialog";
 
 const ALL_STAT_TYPES: StatType[] = [
   "2PT", "3PT", "FT", "AST", "REB", "STL", "BLK", "TO", "FOUL",
@@ -29,11 +30,28 @@ export function HighlightExportModal() {
 
   const handleExport = async () => {
     if (selected.size === 0 || !videoPath) return;
+
+    const types = Array.from(selected);
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const defaultPath = `highlights_${types.join("_")}_${timestamp}.mp4`;
+
+    const savePath = await save({
+      defaultPath,
+      filters: [{ name: "MP4 Video", extensions: ["mp4"] }],
+    });
+
+    if (!savePath) {
+      return;
+    }
+
+    const normalizedPath = savePath.toLowerCase().endsWith(".mp4")
+      ? savePath
+      : `${savePath}.mp4`;
+
     setExporting(true);
     setIsExporting(true);
     setExportProgressVisible(true, "Exporting Highlights");
     try {
-      const types = Array.from(selected);
       const allPlays = await Promise.all(
         types.map((t) => DatabaseService.getPlaysByType(t))
       );
@@ -47,7 +65,7 @@ export function HighlightExportModal() {
         return;
       }
 
-      await ExportService.exportHighlights(videoPath, clips, types, {
+      await ExportService.exportHighlights(videoPath, clips, normalizedPath, {
         onProgress: (update) => {
           updateExportProgress(update.percent, update.status);
         },

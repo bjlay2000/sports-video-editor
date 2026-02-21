@@ -306,16 +306,16 @@ export const useVideoStore = create<VideoState>((set, get) => ({
           : overlay
       ),
     })),
-  removeOverlays: (ids) =>
-    set((state) => ({
-      overlays: state.overlays.filter((overlay) => {
-        const isScoreboard = overlay.type === "scoreboard";
-        if (isScoreboard) return true;
-        if (overlay.locked) return true;
-        return !ids.includes(overlay.id);
-      }),
-      selectedOverlayIds: state.selectedOverlayIds.filter((id) => !ids.includes(id)),
-    })),
+  removeOverlays: (ids) => {
+    const state = get();
+    console.log("[delete] selectedOverlayIds:", state.selectedOverlayIds, "ids to remove:", ids);
+    set({
+      overlays: state.overlays.filter(
+        (o) => !ids.includes(o.id) || o.type === "scoreboard",
+      ),
+      selectedOverlayIds: [],
+    });
+  },
   setSelectedOverlayIds: (ids) => set({ selectedOverlayIds: ids }),
   clearOverlaySelection: () => set({ selectedOverlayIds: [] }),
   bringSelectionForward: () =>

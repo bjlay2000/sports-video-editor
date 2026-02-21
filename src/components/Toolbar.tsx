@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useAppStore } from "../store/appStore";
 import { useVideoStore } from "../store/videoStore";
 import { useTimelineStore } from "../store/timelineStore";
@@ -8,8 +9,12 @@ import { MediaLibrary } from "../services/MediaLibrary";
 import { PlayCoordinator } from "../services/PlayCoordinator";
 
 export function Toolbar() {
+  const [confirmAction, setConfirmAction] = useState<null | "clear-tags" | "clear-highlights" | "new-game">(null);
+  const [showOverlayPrompt, setShowOverlayPrompt] = useState(false);
   const videoPath = useVideoStore((s) => s.videoPath);
   const duration = useVideoStore((s) => s.duration);
+  const showScoreboardOverlay = useVideoStore((s) => s.showScoreboardOverlay);
+  const toggleScoreboardOverlay = useVideoStore((s) => s.toggleScoreboardOverlay);
   const plays = useAppStore((s) => s.plays);
   const markers = useAppStore((s) => s.markers);
   const setShowHighlightModal = useAppStore((s) => s.setShowHighlightModal);
@@ -86,35 +91,62 @@ export function Toolbar() {
 
   const handleExportHighlights = () => {
     if (!videoPath || plays.length === 0) return;
+    if (showScoreboardOverlay) {
+      setShowOverlayPrompt(true);
+      return;
+    }
     setShowHighlightModal(true);
   };
 
-  const handleClearTags = async () => {
+  const handleClearTags = () => {
     if (plays.length === 0) return;
-    const confirmed = window.confirm("Remove all recorded stat tags?");
-    if (!confirmed) return;
-    await PlayCoordinator.clearAllStatTags();
+    setConfirmAction("clear-tags");
   };
 
   const handleClearHighlights = () => {
     const hasHighlights = markers.some((marker) => marker.event_type === "HIGHLIGHT");
     if (!hasHighlights) return;
-    const confirmed = window.confirm("Remove all highlight tags?");
-    if (!confirmed) return;
-    PlayCoordinator.clearAllHighlights();
+    setConfirmAction("clear-highlights");
   };
 
-  const handleNewGame = async () => {
-    const confirmed = window.confirm(
-      "Start a new game? This will reset the score, remove all stat tags, highlights, and manual markers."
-    );
-    if (!confirmed) return;
-    await PlayCoordinator.resetGame();
+  const handleNewGame = () => {
+    setConfirmAction("new-game");
   };
+
+  const handleConfirmDestructiveAction = async () => {
+    const action = confirmAction;
+    if (!action) return;
+    try {
+      if (action === "clear-tags") {
+        await PlayCoordinator.clearAllStatTags();
+      } else if (action === "clear-highlights") {
+        PlayCoordinator.clearAllHighlights();
+      } else if (action === "new-game") {
+        await PlayCoordinator.resetGame();
+      }
+    } finally {
+      setConfirmAction(null);
+    }
+  };
+
+  const confirmTitle =
+    confirmAction === "clear-tags"
+      ? "Clear Tags"
+      : confirmAction === "clear-highlights"
+        ? "Clear Highlights"
+        : "New Game";
+
+  const confirmMessage =
+    confirmAction === "clear-tags"
+      ? "Remove all recorded stat tags?"
+      : confirmAction === "clear-highlights"
+        ? "Remove all highlight tags?"
+        : "Start a new game? This will reset score, stat tags, highlights, and manual markers.";
 
   return (
-    <div className="h-12 bg-surface-dark border-b border-panel-border flex items-center px-4 gap-3 shrink-0">
-      <span className="text-accent font-bold text-lg mr-4">SVE</span>
+    <>
+      <div className="h-12 bg-surface-dark border-b border-panel-border flex items-center px-4 gap-3 shrink-0">
+        <span className="text-accent font-bold text-lg mr-4">SVE</span>
 
       <button
         onClick={handleLoadVideo}
@@ -168,7 +200,67 @@ export function Toolbar() {
         New Game
       </button>
 
-      <div className="flex-1" />
-    </div>
+        <div className="flex-1" />
+      </div>
+
+      {showOverlayPrompt && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+          <div className="bg-panel border border-panel-border rounded-lg p-5 w-96">
+            <h2 className="text-lg font-semibold text-white mb-2">Overlays Enabled</h2>
+            <p className="text-sm text-gray-300 mb-4">
+              Turn off overlays before opening highlight export?
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  toggleScoreboardOverlay(false);
+                  setShowOverlayPrompt(false);
+                  setShowHighlightModal(true);
+                }}
+                className="px-3 py-1.5 bg-accent hover:bg-accent-hover rounded text-sm transition-colors"
+              >
+                Yes
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowOverlayPrompt(false);
+                  setShowHighlightModal(true);
+                }}
+                className="px-3 py-1.5 bg-panel hover:bg-panel-border rounded text-sm transition-colors"
+              >
+                No
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {confirmAction && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+          <div className="bg-panel border border-panel-border rounded-lg p-5 w-96">
+            <h2 className="text-lg font-semibold text-white mb-2">{confirmTitle}</h2>
+            <p className="text-sm text-gray-300 mb-4">{confirmMessage}</p>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setConfirmAction(null)}
+                className="px-3 py-1.5 bg-panel hover:bg-panel-border rounded text-sm transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDestructiveAction}
+                className="px-3 py-1.5 bg-accent hover:bg-accent-hover rounded text-sm transition-colors"
+              >
+                OK
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
