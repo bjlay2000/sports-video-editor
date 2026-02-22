@@ -52,6 +52,7 @@ export class PlayCoordinator {
     await this.removePlays(statIds);
     const reset = await DatabaseService.updateScore(0, 0);
     store.setGame(reset);
+    store.resetHomeScoreEvents(0);
     store.resetOpponentScoreEvents(0);
   }
 
@@ -131,6 +132,7 @@ export class PlayCoordinator {
     if (manualMarkerIds.length > 0) {
       store.removeMarkersByIds(manualMarkerIds);
     }
+    store.resetHomeScoreEvents(0);
     store.resetOpponentScoreEvents(0);
     const timeline = useTimelineStore.getState();
     timeline.setSelectedMarkerIds([]);

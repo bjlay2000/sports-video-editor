@@ -26,6 +26,11 @@ export interface OpponentScoreEvent {
   score: number;
 }
 
+export interface ScoreAdjustmentEvent {
+  time: number;
+  score: number;
+}
+
 export type StatType =
   | "2PT"
   | "3PT"

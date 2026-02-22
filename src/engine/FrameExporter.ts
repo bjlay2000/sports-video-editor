@@ -1,288 +1,309 @@
-import { appDataDir, join } from "@tauri-apps/api/path";
-import { exists, mkdir, remove, writeFile } from "@tauri-apps/plugin-fs";
-import { getRenderState } from "./RenderEngine";
-import { renderFrame } from "./CanvasCompositor";
 import type { TimelineModel } from "./types";
 import type { ClipRange } from "../store/types";
-import { runFfmpeg } from "../services/FfmpegService";
-
-const FRAME_CACHE_DIR = "sve-frame-export";
+import { runFfmpeg, runFfmpegWithStdin } from "../services/FfmpegService";
 
 interface FrameExportOptions {
-  videoSrc: string;
   videoPath: string;
   clips: ClipRange[];
   timelineModel: TimelineModel;
   outputPath: string;
+  width: number;
+  height: number;
   fps?: number;
   onProgress?: (percent: number, status: string) => void;
 }
 
-async function ensureDir(path: string): Promise<void> {
-  if (!(await exists(path))) {
-    await mkdir(path, { recursive: true });
-  }
-}
+type OverlayWorkerOutMessage =
+  | { type: "ready" }
+  | { type: "frame"; frameIndex: number; buffer: ArrayBuffer }
+  | { type: "done" }
+  | { type: "error"; message: string };
 
-function createVideoElement(src: string): Promise<HTMLVideoElement> {
-  return new Promise((resolve, reject) => {
-    const video = document.createElement("video");
-    video.crossOrigin = "anonymous";
-    video.preload = "auto";
-    video.muted = true;
-    video.playsInline = true;
-    video.onloadedmetadata = () => resolve(video);
-    video.onerror = () => reject(new Error("Failed to load video for export"));
-    video.src = src;
-  });
-}
+type OverlayWorkerInMessage =
+  | { type: "init"; width: number; height: number; timelineModel: TimelineModel }
+  | { type: "start"; totalFrames: number; fps: number }
+  | { type: "recycle"; buffer: ArrayBuffer };
 
-function seekTo(video: HTMLVideoElement, time: number): Promise<void> {
-  return new Promise((resolve) => {
-    const target = Math.max(0, Math.min(time, video.duration || 0));
-    if (Math.abs(video.currentTime - target) < 0.001) {
-      resolve();
-      return;
-    }
-    const handler = () => {
-      video.removeEventListener("seeked", handler);
-      resolve();
+type VideoEncoderProfile =
+  | {
+      codecArgs: string[];
+      label: "h264_nvenc" | "h264_qsv" | "libx264";
     };
-    video.addEventListener("seeked", handler);
-    video.currentTime = target;
-  });
-}
 
-function frameToSourceTime(
-  frameIndex: number,
-  fps: number,
-  clips: ClipRange[],
-): number {
-  let remaining = frameIndex / fps;
-  for (const clip of clips) {
-    const len = Math.max(0, clip.end_time - clip.start_time);
-    if (remaining <= len + 0.0001) {
-      return clip.start_time + remaining;
-    }
-    remaining -= len;
-  }
-  const last = clips[clips.length - 1];
-  return last ? last.end_time : 0;
-}
+let detectedEncoderProfilePromise: Promise<VideoEncoderProfile> | null = null;
 
-function totalClipDuration(clips: ClipRange[]): number {
-  return clips.reduce(
-    (sum, c) => sum + Math.max(0, c.end_time - c.start_time),
-    0,
-  );
-}
-
-function buildAudioConcatFilter(clips: ClipRange[]): string {
-  if (clips.length === 0) return "";
-
+function buildConcatOverlayFilter(clips: ClipRange[]): string {
   const parts: string[] = [];
-  const labels: string[] = [];
+  const concatInputs: string[] = [];
 
   for (let i = 0; i < clips.length; i++) {
     parts.push(
+      `[1:v]trim=start=${clips[i].start_time}:end=${clips[i].end_time},setpts=PTS-STARTPTS[v${i}]`,
+    );
+    parts.push(
       `[1:a]atrim=start=${clips[i].start_time}:end=${clips[i].end_time},asetpts=PTS-STARTPTS[a${i}]`,
     );
-    labels.push(`[a${i}]`);
+    concatInputs.push(`[v${i}]`, `[a${i}]`);
   }
 
-  if (clips.length === 1) {
-    return parts[0].replace(`[a0]`, `[aout]`);
-  }
+  parts.push(`${concatInputs.join("")}concat=n=${clips.length}:v=1:a=1[vcat][aout]`);
+  parts.push(`[0:v]format=rgba,setpts=PTS-STARTPTS[ov]`);
+  parts.push(`[vcat][ov]overlay=0:0:shortest=1[vout]`);
 
-  parts.push(
-    `${labels.join("")}concat=n=${clips.length}:v=0:a=1[aout]`,
-  );
   return parts.join("; ");
 }
 
+async function detectVideoEncoderProfile(): Promise<VideoEncoderProfile> {
+  if (detectedEncoderProfilePromise) {
+    return detectedEncoderProfilePromise;
+  }
+
+  detectedEncoderProfilePromise = (async () => {
+    try {
+      const encodersOutput = await runFfmpeg(["-hide_banner", "-encoders"]);
+      const lower = encodersOutput.toLowerCase();
+
+      if (lower.includes("h264_nvenc")) {
+        return {
+          label: "h264_nvenc",
+          codecArgs: [
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p4",
+            "-b:v",
+            "40M",
+            "-maxrate",
+            "50M",
+            "-bufsize",
+            "80M",
+          ],
+        };
+      }
+
+      if (lower.includes("h264_qsv")) {
+        return {
+          label: "h264_qsv",
+          codecArgs: ["-c:v", "h264_qsv"],
+        };
+      }
+    } catch {
+      // fallback to software encode
+    }
+
+    return {
+      label: "libx264",
+      codecArgs: [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "superfast",
+        "-crf",
+        "18",
+        "-threads",
+        "0",
+      ],
+    };
+  })();
+
+  return detectedEncoderProfilePromise;
+}
+
+async function createAndInitOverlayWorker(
+  width: number,
+  height: number,
+  timelineModel: TimelineModel,
+): Promise<Worker> {
+  const worker = new Worker(new URL("./OverlayRenderWorker.ts", import.meta.url), {
+    type: "module",
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    const onMessage = (event: MessageEvent<OverlayWorkerOutMessage>) => {
+      if (event.data.type === "ready") {
+        worker.removeEventListener("message", onMessage);
+        resolve();
+        return;
+      }
+      if (event.data.type === "error") {
+        worker.removeEventListener("message", onMessage);
+        reject(new Error(event.data.message));
+      }
+    };
+
+    const onError = (event: ErrorEvent) => {
+      worker.removeEventListener("message", onMessage);
+      reject(event.error ?? new Error(event.message));
+    };
+
+    worker.addEventListener("message", onMessage);
+    worker.addEventListener("error", onError, { once: true });
+
+    const initMessage: OverlayWorkerInMessage = {
+      type: "init",
+      width,
+      height,
+      timelineModel,
+    };
+    worker.postMessage(initMessage);
+  });
+
+  return worker;
+}
+
 /**
- * Frame-by-frame export pipeline.
- *
- * 1. Creates a hidden video element for seeking.
- * 2. For each frame: seek video, composite video + overlays to canvas,
- *    export to PNG.
- * 3. Runs ffmpeg with the PNG image sequence + audio from the original
- *    video file.
- *
- * Both preview and export use the same RenderEngine + CanvasCompositor
- * for pixel-identical overlay rendering.
+ * Overlay streaming export pipeline.
+ * Browser renders overlay RGBA frames and streams raw bytes to ffmpeg stdin.
+ * ffmpeg handles source decode, clip trim/concat, overlay composition, and encode.
  */
 export async function exportWithFrames(
   options: FrameExportOptions,
 ): Promise<string> {
   const {
-    videoSrc,
     videoPath,
     clips,
     timelineModel,
     outputPath,
+    width,
+    height,
     onProgress,
   } = options;
   const fps = options.fps ?? 30;
-  const duration = totalClipDuration(clips);
+  const duration = clips.reduce(
+    (sum, clip) => sum + Math.max(0, clip.end_time - clip.start_time),
+    0,
+  );
   const totalFrames = Math.ceil(duration * fps);
 
   if (totalFrames <= 0) {
     throw new Error("No frames to export");
   }
+  if (width <= 0 || height <= 0) {
+    throw new Error("Invalid export dimensions");
+  }
 
   onProgress?.(0, "Preparing frame export...");
 
-  // Create hidden video element for frame capture
-  const exportVideo = await createVideoElement(videoSrc);
+  const filterComplex = buildConcatOverlayFilter(clips);
+  const encoderProfile = await detectVideoEncoderProfile();
+  const overlayWorker = await createAndInitOverlayWorker(width, height, timelineModel);
+  let maxPercent = 0;
 
-  // Create temp directory for frame images
-  const root = await appDataDir();
-  const sessionId = `export-${Date.now()}`;
-  const sessionDir = await join(root, FRAME_CACHE_DIR, sessionId);
-  await ensureDir(sessionDir);
-
-  // Create compositing canvases
-  const videoWidth = exportVideo.videoWidth || 1920;
-  const videoHeight = exportVideo.videoHeight || 1080;
-
-  const canvas = document.createElement("canvas");
-  canvas.width = videoWidth;
-  canvas.height = videoHeight;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("Cannot create canvas context");
-
-  const overlayCanvas = document.createElement("canvas");
-  overlayCanvas.width = videoWidth;
-  overlayCanvas.height = videoHeight;
-  const overlayCtx = overlayCanvas.getContext("2d");
-  if (!overlayCtx) throw new Error("Cannot create overlay canvas context");
-
-  const framePaths: string[] = [];
+  const ffmpegArgs = [
+  "-y",
+  "-f",
+  "rawvideo",
+  "-pix_fmt",
+  "rgba",
+  "-s",
+  `${width}x${height}`,
+  "-r",
+  String(fps),
+  "-i",
+  "pipe:0",
+  "-f",
+  "null",
+  "-"
+];
 
   try {
-    // ---- Phase 1: Render frames (0–80% progress) ----
-    for (let i = 0; i < totalFrames; i++) {
-      const sourceTime = frameToSourceTime(i, fps, clips);
+    await runFfmpegWithStdin(
+      ffmpegArgs,
+      async ({ write, flush }) => {
+      const startTime = performance.now();
+      let framesProcessed = 0;
 
-      await seekTo(exportVideo, sourceTime);
+      await new Promise<void>((resolve, reject) => {
+        const pendingRecycleWrites = new Set<Promise<void>>();
 
-      // Draw video frame
-      ctx.clearRect(0, 0, videoWidth, videoHeight);
-      ctx.drawImage(exportVideo, 0, 0, videoWidth, videoHeight);
+        const onMessage = (event: MessageEvent<OverlayWorkerOutMessage>) => {
+          const payload = event.data;
+          if (payload.type === "frame") {
+            framesProcessed = payload.frameIndex + 1;
+            const writePromise = write(new Uint8Array(payload.buffer))
+              .then(() => {
+                const recycleMessage: OverlayWorkerInMessage = {
+                  type: "recycle",
+                  buffer: payload.buffer,
+                };
+                overlayWorker.postMessage(recycleMessage, [payload.buffer]);
+              })
+              .finally(() => {
+                pendingRecycleWrites.delete(writePromise);
+              });
 
-      // Compute and draw overlays using the unified render pipeline
-      const renderState = getRenderState(timelineModel, sourceTime);
-      if (renderState.overlays.length > 0) {
-        await renderFrame(
-          overlayCtx,
-          renderState,
-          videoWidth,
-          videoHeight,
-        );
-        ctx.drawImage(overlayCanvas, 0, 0);
-      }
+            pendingRecycleWrites.add(writePromise);
 
-      // Export frame as PNG
-      const blob: Blob | null = await new Promise((r) =>
-        canvas.toBlob(r, "image/png"),
-      );
-      if (!blob) continue;
-
-      const buffer = await blob.arrayBuffer();
-      const frameName = `frame_${i.toString().padStart(6, "0")}.png`;
-      const framePath = await join(sessionDir, frameName);
-      await writeFile(framePath, new Uint8Array(buffer));
-      framePaths.push(framePath);
-
-      const progress = ((i + 1) / totalFrames) * 80;
-      onProgress?.(
-        progress,
-        `Rendering frame ${i + 1}/${totalFrames}`,
-      );
-    }
-
-    if (framePaths.length === 0) {
-      throw new Error("No frames were rendered");
-    }
-
-    // ---- Phase 2: Encode with ffmpeg (80–100% progress) ----
-    onProgress?.(80, "Encoding video...");
-
-    const framePattern = await join(sessionDir, "frame_%06d.png");
-    const audioFilter = buildAudioConcatFilter(clips);
-
-    const ffmpegArgs = [
-      "-y",
-      "-progress",
-      "pipe:1",
-      "-nostats",
-      "-framerate",
-      String(fps),
-      "-i",
-      framePattern,
-      "-i",
-      videoPath,
-      ...(audioFilter.length > 0
-        ? [
-            "-filter_complex",
-            audioFilter,
-            "-map",
-            "0:v",
-            "-map",
-            "[aout]",
-          ]
-        : ["-map", "0:v", "-an"]),
-      "-c:v",
-      "libx264",
-      "-preset",
-      "veryfast",
-      "-crf",
-      "20",
-      "-pix_fmt",
-      "yuv420p",
-      ...(audioFilter.length > 0
-        ? ["-c:a", "aac", "-b:a", "192k"]
-        : []),
-      outputPath,
-    ];
-
-    await runFfmpeg(ffmpegArgs, {
-      onProgress: (payload) => {
-        if (payload.key === "frame") {
-          const frame = parseInt(payload.value, 10);
-          if (Number.isFinite(frame)) {
-            const pct = 80 + (frame / totalFrames) * 20;
+            const elapsed = (performance.now() - startTime) / 1000;
+            const effectiveFps = framesProcessed / Math.max(elapsed, 0.0001);
+            const percent = (framesProcessed / totalFrames) * 90;
+            maxPercent = Math.max(maxPercent, percent);
             onProgress?.(
-              Math.min(99, pct),
-              `Encoding frame ${frame}/${totalFrames}`,
+              percent,
+              `Rendering ${percent.toFixed(1)}% (${framesProcessed}/${totalFrames}) @ ${effectiveFps.toFixed(1)} FPS`,
+            );
+            return;
+          }
+
+          if (payload.type === "done") {
+            overlayWorker.removeEventListener("message", onMessage);
+            Promise.all([...pendingRecycleWrites])
+              .then(() => resolve())
+              .catch((error) => reject(error));
+            return;
+          }
+
+          if (payload.type === "error") {
+            overlayWorker.removeEventListener("message", onMessage);
+            reject(new Error(payload.message));
+          }
+        };
+
+        const onError = (event: ErrorEvent) => {
+          overlayWorker.removeEventListener("message", onMessage);
+          reject(event.error ?? new Error(event.message));
+        };
+
+        overlayWorker.addEventListener("message", onMessage);
+        overlayWorker.addEventListener("error", onError, { once: true });
+        const startMessage: OverlayWorkerInMessage = { type: "start", totalFrames, fps };
+        overlayWorker.postMessage(startMessage);
+      });
+
+      await flush();
+      const totalElapsed = (performance.now() - startTime) / 1000;
+      const finalFps = totalFrames / Math.max(totalElapsed, 0.0001);
+      console.log(
+        `Export feed complete. Effective FPS: ${finalFps.toFixed(2)} (${encoderProfile.label})`,
+      );
+
+      maxPercent = Math.max(maxPercent, 90);
+      onProgress?.(90, "Encoding video...");
+      },
+      {
+        onProgress: (payload) => {
+        if (payload.key === "frame") {
+          const frame = Number.parseInt(payload.value, 10);
+          if (Number.isFinite(frame)) {
+            const encodingPercent = 90 + (frame / totalFrames) * 10;
+            const nextPercent = Math.min(99, Math.max(maxPercent, encodingPercent));
+            maxPercent = Math.max(maxPercent, nextPercent);
+            onProgress?.(
+              nextPercent,
+              `Encoding ${nextPercent.toFixed(1)}% (${frame}/${totalFrames})`,
             );
           }
         }
+
         if (payload.key === "progress" && payload.value === "end") {
-          onProgress?.(100, "Export complete");
+          onProgress?.(100, `Export complete (Processed ${totalFrames} frames)`);
         }
+        },
       },
-    });
-
-    return outputPath;
+    );
   } finally {
-    // Cleanup temp frames
-    for (const fp of framePaths) {
-      try {
-        await remove(fp);
-      } catch {
-        /* ignore */
-      }
-    }
-    try {
-      await remove(sessionDir);
-    } catch {
-      /* ignore */
-    }
-
-    // Release hidden video element
-    exportVideo.src = "";
-    exportVideo.load();
+    overlayWorker.terminate();
   }
+
+  return outputPath;
 }

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useAppStore } from "../store/appStore";
 import { useVideoStore } from "../store/videoStore";
 import { useTimelineStore } from "../store/timelineStore";
@@ -7,6 +7,7 @@ import { ExportService } from "../services/ExportService";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { MediaLibrary } from "../services/MediaLibrary";
 import { PlayCoordinator } from "../services/PlayCoordinator";
+import { ProjectService } from "../services/ProjectService";
 
 export function Toolbar() {
   const [confirmAction, setConfirmAction] = useState<null | "clear-tags" | "clear-highlights" | "new-game">(null);
@@ -18,12 +19,90 @@ export function Toolbar() {
   const plays = useAppStore((s) => s.plays);
   const markers = useAppStore((s) => s.markers);
   const setShowHighlightModal = useAppStore((s) => s.setShowHighlightModal);
+  const setShowExportStatsModal = useAppStore((s) => s.setShowExportStatsModal);
+  const projectSavedSignature = useAppStore((s) => s.projectSavedSignature);
+  const setProjectSavedSignature = useAppStore((s) => s.setProjectSavedSignature);
   const setIsExporting = useAppStore((s) => s.setIsExporting);
   const isExporting = useAppStore((s) => s.isExporting);
   const setExportProgressVisible = useAppStore((s) => s.setExportProgressVisible);
   const updateExportProgress = useAppStore((s) => s.updateExportProgress);
   const segments = useTimelineStore((s) => s.segments);
   const pushToast = useToastStore((s) => s.pushToast);
+  const [isProjectDirty, setIsProjectDirty] = useState(false);
+  const [dirtyReason, setDirtyReason] = useState<string>("project change");
+  const [currentProjectPath, setCurrentProjectPath] = useState<string | null>(null);
+  const [lastAutosavedAt, setLastAutosavedAt] = useState<Date | null>(null);
+
+  const formatSavedTime = (value: Date | null) => {
+    if (!value) return null;
+    return value.toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  };
+
+  const inferDirtyReason = (savedSignature: string, currentSignature: string) => {
+    try {
+      const saved = JSON.parse(savedSignature);
+      const current = JSON.parse(currentSignature);
+
+      if (JSON.stringify(saved.video?.overlays) !== JSON.stringify(current.video?.overlays)) {
+        return "overlay edit";
+      }
+      if (JSON.stringify(saved.app?.game) !== JSON.stringify(current.app?.game)) {
+        return "score change";
+      }
+      if (JSON.stringify(saved.app?.plays) !== JSON.stringify(current.app?.plays)) {
+        return "timeline edit";
+      }
+      if (JSON.stringify(saved.timeline?.segments) !== JSON.stringify(current.timeline?.segments)) {
+        return "timeline edit";
+      }
+      if (JSON.stringify(saved.video?.videoTrackKeyframes) !== JSON.stringify(current.video?.videoTrackKeyframes)) {
+        return "video transform edit";
+      }
+      return "project change";
+    } catch {
+      return "project change";
+    }
+  };
+
+  useEffect(() => {
+    const ensureBaseline = () => {
+      const current = ProjectService.getProjectSignature();
+      if (!projectSavedSignature) {
+        setProjectSavedSignature(current);
+        setIsProjectDirty(false);
+        setDirtyReason("project change");
+      } else {
+        const dirty = projectSavedSignature !== current;
+        setIsProjectDirty(dirty);
+        if (dirty) {
+          setDirtyReason(inferDirtyReason(projectSavedSignature, current));
+        }
+      }
+    };
+
+    ensureBaseline();
+    const timer = window.setInterval(ensureBaseline, 800);
+    return () => window.clearInterval(timer);
+  }, [projectSavedSignature, setProjectSavedSignature]);
+
+  useEffect(() => {
+    const timer = window.setInterval(async () => {
+      if (!currentProjectPath || !isProjectDirty) return;
+      try {
+        await ProjectService.saveProject(currentProjectPath);
+        setProjectSavedSignature(ProjectService.getProjectSignature());
+        setLastAutosavedAt(new Date());
+      } catch (error) {
+        console.error("Auto-save failed", error);
+      }
+    }, 60_000);
+
+    return () => window.clearInterval(timer);
+  }, [currentProjectPath, isProjectDirty, setProjectSavedSignature]);
 
   const handleLoadVideo = async () => {
     try {
@@ -86,6 +165,51 @@ export function Toolbar() {
     } finally {
       setIsExporting(false);
       setExportProgressVisible(false);
+    }
+  };
+
+  const handleSaveProject = async () => {
+    const targetPath = await save({
+      defaultPath: "project.svp",
+      filters: [{ name: "Sports Video Project", extensions: ["svp"] }],
+    });
+
+    if (!targetPath) return;
+    const normalizedPath = targetPath.toLowerCase().endsWith(".svp")
+      ? targetPath
+      : `${targetPath}.svp`;
+
+    try {
+      await ProjectService.saveProject(normalizedPath);
+      setCurrentProjectPath(normalizedPath);
+      setProjectSavedSignature(ProjectService.getProjectSignature());
+      setLastAutosavedAt(new Date());
+      pushToast("Project saved", "success");
+    } catch (error: any) {
+      console.error(error);
+      pushToast(`Save project failed: ${error?.message ?? error}`, "error");
+    }
+  };
+
+  const handleLoadProject = async () => {
+    const selection = await open({
+      multiple: false,
+      filters: [{ name: "Sports Video Project", extensions: ["svp"] }],
+    });
+    if (!selection) return;
+
+    const projectPath = Array.isArray(selection) ? selection[0] : selection;
+    if (typeof projectPath !== "string") return;
+
+    try {
+      await ProjectService.loadProject(projectPath);
+      setCurrentProjectPath(projectPath);
+      setProjectSavedSignature(ProjectService.getProjectSignature());
+      setLastAutosavedAt(new Date());
+      pushToast("Project loaded", "success");
+    } catch (error: any) {
+      console.error(error);
+      pushToast(`Load project failed: ${error?.message ?? error}`, "error");
     }
   };
 
@@ -156,6 +280,22 @@ export function Toolbar() {
       </button>
 
       <button
+        onClick={handleLoadProject}
+        className="px-3 py-1.5 bg-panel hover:bg-panel-border rounded text-sm transition-colors"
+      >
+        Load Project
+      </button>
+
+      <button
+        onClick={handleSaveProject}
+        className="px-3 py-1.5 bg-panel hover:bg-panel-border rounded text-sm transition-colors"
+      >
+        Save Project
+      </button>
+
+      <div className="w-px h-6 bg-panel-border" />
+
+      <button
         onClick={handleExportFull}
         disabled={
           isExporting ||
@@ -173,6 +313,14 @@ export function Toolbar() {
         className="px-3 py-1.5 bg-panel hover:bg-panel-border rounded text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
       >
         Export Highlights
+      </button>
+
+      <button
+        onClick={() => setShowExportStatsModal(true)}
+        disabled={plays.length === 0}
+        className="px-3 py-1.5 bg-panel hover:bg-panel-border rounded text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+      >
+        Export Stats
       </button>
 
       <div className="w-px h-6 bg-panel-border mx-2" />
@@ -201,6 +349,25 @@ export function Toolbar() {
       </button>
 
         <div className="flex-1" />
+
+        <span
+          className={`text-[11px] uppercase tracking-wider ${
+            isProjectDirty ? "text-amber-300" : "text-gray-500"
+          }`}
+          title={
+            isProjectDirty
+              ? `Unsaved: ${dirtyReason}`
+              : lastAutosavedAt
+                ? `All changes saved • Last autosave ${formatSavedTime(lastAutosavedAt)}`
+                : "All changes saved"
+          }
+        >
+          {isProjectDirty
+            ? "● Unsaved Changes"
+            : lastAutosavedAt
+              ? `Saved • ${formatSavedTime(lastAutosavedAt)}`
+              : "Saved"}
+        </span>
       </div>
 
       {showOverlayPrompt && (

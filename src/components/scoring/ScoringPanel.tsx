@@ -104,6 +104,7 @@ export function ScoringPanel() {
   const setGame = useAppStore((s) => s.setGame);
   const opponentScoreEvents = useAppStore((s) => s.opponentScoreEvents);
   const logOpponentScoreEvent = useAppStore((s) => s.logOpponentScoreEvent);
+  const logHomeScoreEvent = useAppStore((s) => s.logHomeScoreEvent);
   const videoSrc = useVideoStore((s) => s.videoSrc);
   const currentTime = useVideoStore((s) => s.currentTime);
   const setVideoTime = useVideoStore((s) => s.setCurrentTime);
@@ -128,6 +129,14 @@ export function ScoringPanel() {
     const updated = await DatabaseService.updateScore(game.home_score, nextAway);
     setGame(updated);
     logOpponentScoreEvent(nextAway, currentTime);
+  };
+
+  const adjustHomeScore = async (delta: number) => {
+    const nextHome = Math.max(0, game.home_score + delta);
+    if (nextHome === game.home_score) return;
+    const updated = await DatabaseService.updateScore(nextHome, game.away_score);
+    setGame(updated);
+    logHomeScoreEvent(nextHome, currentTime);
   };
 
   const recentPlays = [...plays]
@@ -251,7 +260,26 @@ export function ScoringPanel() {
             <div className="text-xs text-gray-400 mt-1">AWAY</div>
           </div>
         </div>
-          <div className="mt-3 flex justify-end">
+          <div className="mt-3 flex justify-between gap-4">
+            <div className="flex flex-col items-start gap-1 text-[11px] text-gray-400 uppercase tracking-wider">
+              <span>Home Score</span>
+              <div className="flex overflow-hidden rounded border border-panel-border">
+                <button
+                  type="button"
+                  onClick={() => adjustHomeScore(-1)}
+                  className="px-3 py-1 bg-panel hover:bg-panel-border transition-colors"
+                >
+                  −1
+                </button>
+                <button
+                  type="button"
+                  onClick={() => adjustHomeScore(1)}
+                  className="px-3 py-1 bg-panel hover:bg-panel-border border-l border-panel-border transition-colors"
+                >
+                  +1
+                </button>
+              </div>
+            </div>
             <div className="flex flex-col items-end gap-1 text-[11px] text-gray-400 uppercase tracking-wider">
               <span>Opponent Score</span>
               <div className="flex overflow-hidden rounded border border-panel-border">
@@ -272,15 +300,21 @@ export function ScoringPanel() {
               </div>
             </div>
           </div>
-          {showStatsDrawer && (
-            <div className="mt-4 rounded-lg border border-panel-border bg-surface p-3 shadow-inner shadow-black/30">
+
+          <div
+            className={`mt-4 rounded-lg border border-panel-border bg-surface p-3 shadow-inner shadow-black/30 transform transition-all duration-300 ease-out ${
+              showStatsDrawer
+                ? "translate-x-0 opacity-100 max-h-[55vh]"
+                : "translate-x-6 opacity-0 max-h-0 overflow-hidden pointer-events-none border-transparent p-0"
+            }`}
+          >
               <h4 className="text-xs font-semibold text-gray-300 uppercase tracking-wider mb-2">
                 Player Stats
               </h4>
               {statRows.length === 0 ? (
                 <p className="text-xs text-gray-500">No players added yet.</p>
               ) : (
-                <div className="overflow-auto">
+                <div className="overflow-auto max-h-[44vh] pr-1">
                   <table className="w-full text-[11px] text-gray-200">
                     <thead>
                       <tr className="text-[10px] uppercase tracking-wider text-gray-500">
@@ -345,8 +379,7 @@ export function ScoringPanel() {
                   </table>
                 </div>
               )}
-            </div>
-          )}
+          </div>
         </div>
       </div>
 

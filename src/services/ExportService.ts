@@ -21,6 +21,7 @@ function buildTimelineModel(): TimelineModel {
   const scoreEvents = deriveScoreEvents(
     appState.plays,
     appState.opponentScoreEvents,
+    appState.homeScoreEvents,
   );
 
   return {
@@ -56,11 +57,12 @@ export class ExportService {
     const timelineModel = buildTimelineModel();
 
     return exportWithFrames({
-      videoSrc: videoState.videoSrc,
       videoPath,
       clips: sortedClips,
       timelineModel,
       outputPath,
+      width: videoState.videoWidth || 1920,
+      height: videoState.videoHeight || 1080,
       onProgress: options?.onProgress
         ? (pct, status) => options.onProgress!({ percent: pct, status })
         : undefined,
@@ -86,11 +88,12 @@ export class ExportService {
     const timelineModel = buildTimelineModel();
 
     return exportWithFrames({
-      videoSrc: videoState.videoSrc,
       videoPath,
       clips: sortedClips,
       timelineModel,
       outputPath,
+      width: videoState.videoWidth || 1920,
+      height: videoState.videoHeight || 1080,
       onProgress: options?.onProgress
         ? (pct, status) => options.onProgress!({ percent: pct, status })
         : undefined,

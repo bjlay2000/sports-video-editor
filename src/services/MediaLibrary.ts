@@ -65,6 +65,18 @@ export class MediaLibrary {
 
     videoState.setDuration(duration);
     videoState.updateClip(activeClipId, { duration });
+
+    const existingClip = videoState.clips.find((clip) => clip.id === activeClipId);
+    const existingAssets = existingClip?.assets;
+    if (existingAssets && (existingAssets.thumbnails.length > 0 || Boolean(existingAssets.waveformSrc))) {
+      timeline.setTimelineAssets({
+        thumbnails: existingAssets.thumbnails,
+        waveformSrc: existingAssets.waveformSrc,
+      });
+      timeline.setAssetsLoading(false);
+      return;
+    }
+
     timeline.setAssetsLoading(true);
 
     const applyAssets = (assets: TimelineAssets) => {

@@ -15,6 +15,7 @@ interface FollowUpContext {
   startTime: number;
   endTime: number;
   needsRebound: boolean;
+  primaryPlayerId: number;
 }
 
 const describeStat = (stat: string | null) => {
@@ -34,6 +35,8 @@ export function PlayerSelectModal() {
   const pendingStatTimestamp = useAppStore((s) => s.pendingStatTimestamp);
   const setShowPlayerModal = useAppStore((s) => s.setShowPlayerModal);
   const setPendingStat = useAppStore((s) => s.setPendingStat);
+  const onCourtPlayerIds = useAppStore((s) => s.onCourtPlayerIds);
+  const toggleOnCourtPlayer = useAppStore((s) => s.toggleOnCourtPlayer);
   const addPlay = useAppStore((s) => s.addPlay);
   const addMarker = useAppStore((s) => s.addMarker);
   const game = useAppStore((s) => s.game);
@@ -55,6 +58,28 @@ export function PlayerSelectModal() {
       endTime: captureTime + 2,
     };
   }, [pendingStatTimestamp, currentTime]);
+
+  const sortedPlayers = useMemo(
+    () => [...players].sort((a, b) => a.number - b.number || a.name.localeCompare(b.name)),
+    [players],
+  );
+
+  const selectablePlayers = useMemo(() => {
+    if (step !== "assist" || !followUpContext) {
+      return sortedPlayers;
+    }
+    return sortedPlayers.filter((player) => player.id !== followUpContext.primaryPlayerId);
+  }, [step, followUpContext, sortedPlayers]);
+
+  const onCourtSet = useMemo(() => new Set(onCourtPlayerIds), [onCourtPlayerIds]);
+  const playersOnCourt = useMemo(
+    () => selectablePlayers.filter((player) => onCourtSet.has(player.id)),
+    [selectablePlayers, onCourtSet],
+  );
+  const playersOffCourt = useMemo(
+    () => selectablePlayers.filter((player) => !onCourtSet.has(player.id)),
+    [selectablePlayers, onCourtSet],
+  );
 
   const persistPlay = async (
     playerId: number,
@@ -111,7 +136,7 @@ export function PlayerSelectModal() {
       const needsRebound = REBOUND_PROMPT_STATS.includes(pendingStat as StatType);
 
       if (needsAssist || needsRebound) {
-        setFollowUpContext({ captureTime, startTime, endTime, needsRebound });
+        setFollowUpContext({ captureTime, startTime, endTime, needsRebound, primaryPlayerId: playerId });
         setStep(needsAssist ? "assist" : "rebound");
         return;
       }
@@ -229,19 +254,61 @@ export function PlayerSelectModal() {
           </div>
         )}
 
-        <div className="space-y-1.5">
-          {players.map((player) => (
-            <button
-              key={player.id}
-              onClick={() => onSelect(player.id)}
-              className="w-full text-left px-3 py-2 bg-surface hover:bg-surface-light rounded transition-colors flex items-center gap-3"
-            >
-              <span className="text-accent font-bold text-sm w-8">
-                #{player.number}
-              </span>
-              <span className="text-white text-sm">{player.name}</span>
-            </button>
-          ))}
+        <div className="space-y-2">
+          <div className="text-[10px] uppercase tracking-wider text-gray-500">On Court</div>
+          <div className="space-y-1.5">
+            {playersOnCourt.map((player) => (
+              <button
+                key={player.id}
+                onClick={() => onSelect(player.id)}
+                className="w-full text-left px-3 py-2 bg-surface hover:bg-surface-light rounded transition-colors flex items-center gap-3"
+              >
+                <span className="text-accent font-bold text-sm w-8">
+                  #{player.number}
+                </span>
+                <span className="text-white text-sm flex-1">{player.name}</span>
+                <input
+                  type="checkbox"
+                  checked={onCourtSet.has(player.id)}
+                  onClick={(event) => event.stopPropagation()}
+                  onChange={(event) => toggleOnCourtPlayer(player.id, event.target.checked)}
+                  className="accent-accent"
+                />
+              </button>
+            ))}
+          </div>
+
+          <div className="flex items-center gap-2 text-[10px] uppercase tracking-wider text-gray-500">
+            <div className="h-px flex-1 bg-panel-border" />
+            <span>Bench</span>
+            <div className="h-px flex-1 bg-panel-border" />
+          </div>
+
+          <div className="space-y-1.5">
+            {playersOffCourt.map((player) => (
+              <button
+                key={player.id}
+                onClick={() => onSelect(player.id)}
+                className="w-full text-left px-3 py-2 bg-surface hover:bg-surface-light rounded transition-colors flex items-center gap-3"
+              >
+                <span className="text-accent font-bold text-sm w-8">
+                  #{player.number}
+                </span>
+                <span className="text-white text-sm flex-1">{player.name}</span>
+                <input
+                  type="checkbox"
+                  checked={onCourtSet.has(player.id)}
+                  onClick={(event) => event.stopPropagation()}
+                  onChange={(event) => toggleOnCourtPlayer(player.id, event.target.checked)}
+                  className="accent-accent"
+                />
+              </button>
+            ))}
+          </div>
+
+          {playersOnCourt.length === 0 && playersOffCourt.length === 0 && (
+            <p className="text-xs text-gray-500">No eligible players available.</p>
+          )}
         </div>
       </div>
     </div>
