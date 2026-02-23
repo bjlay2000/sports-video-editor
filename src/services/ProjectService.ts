@@ -43,6 +43,21 @@ interface ProjectSnapshot {
   };
 }
 
+const STAT_EVENT_TYPES = new Set([
+  "2PT",
+  "3PT",
+  "FT",
+  "2PT_MISS",
+  "3PT_MISS",
+  "FT_MISS",
+  "AST",
+  "REB",
+  "STL",
+  "BLK",
+  "TO",
+  "FOUL",
+]);
+
 function toUtf8(input: string): Uint8Array {
   return new TextEncoder().encode(input);
 }
@@ -138,6 +153,15 @@ export class ProjectService {
     if (!parsed.app.homeScoreEvents) {
       parsed.app.homeScoreEvents = [{ time: 0, score: 0 }];
     }
+    if (!Array.isArray(parsed.app.players)) parsed.app.players = [];
+    if (!Array.isArray(parsed.app.onCourtPlayerIds)) parsed.app.onCourtPlayerIds = [];
+    if (!Array.isArray(parsed.app.plays)) parsed.app.plays = [];
+    if (!Array.isArray(parsed.app.markers)) parsed.app.markers = [];
+    if (!Array.isArray(parsed.app.opponentScoreEvents)) {
+      parsed.app.opponentScoreEvents = [{ time: 0, score: 0 }];
+    }
+    if (!Array.isArray(parsed.video.clips)) parsed.video.clips = [];
+    if (!Array.isArray(parsed.timeline.segments)) parsed.timeline.segments = [];
     return parsed;
   }
 
@@ -150,12 +174,29 @@ export class ProjectService {
 
     const activeClip = hydratedClips.find((clip) => clip.id === project.video.activeClipId) ?? hydratedClips[0] ?? null;
 
+    const statMarkers: TimelineMarker[] = project.app.plays.map((play) => ({
+      id: play.id,
+      time: play.timestamp,
+      event_type: play.event_type,
+      player_name: play.player_name,
+      player_number: play.player_number,
+      start_time: play.start_time,
+      end_time: play.end_time,
+      label: play.event_type,
+    }));
+
+    const nonStatMarkers = project.app.markers.filter(
+      (marker) => !STAT_EVENT_TYPES.has(marker.event_type),
+    );
+
+    const mergedMarkers: TimelineMarker[] = [...statMarkers, ...nonStatMarkers];
+
     useAppStore.setState({
       players: project.app.players,
       onCourtPlayerIds: project.app.onCourtPlayerIds,
       plays: project.app.plays,
       game: project.app.game,
-      markers: project.app.markers,
+      markers: mergedMarkers,
       opponentScoreEvents: project.app.opponentScoreEvents,
       homeScoreEvents: project.app.homeScoreEvents,
       pendingStat: null,

@@ -4,7 +4,12 @@ import { ClipRange } from "../store/types";
 import { useVideoStore } from "../store/videoStore";
 import { useAppStore } from "../store/appStore";
 import { deriveScoreEvents } from "../engine/scoreEvents";
-import { runExport, type ExportConfig, type ExportResult } from "../export/ExportEngine";
+import {
+  runExport,
+  runHighlightExportSegmented,
+  type ExportConfig,
+  type ExportResult,
+} from "../export/ExportEngine";
 import { cancelActiveFfmpeg, runFfmpeg } from "./FfmpegService";
 import { logExportEvent } from "./ExportLogService";
 import {
@@ -31,6 +36,8 @@ export interface ExportSummary extends ExportResult {
 
 let ffmpegDiagnosticsLogged: Promise<void> | null = null;
 let ffmpegPresetCommandValidationLogged = false;
+
+const MIN_HIGHLIGHT_SEGMENT_SEC = 1.5;
 
 async function logPresetCommandTemplatesOnce(): Promise<void> {
   if (ffmpegPresetCommandValidationLogged) return;
@@ -59,7 +66,36 @@ async function logPresetCommandTemplatesOnce(): Promise<void> {
       "ExportService",
       `validation.command preset=${preset} args=[${templateArgs.join(" ")}]`,
     );
+
+    const segmentedTemplate = [
+      "ffmpeg",
+      "-y",
+      "-ss", "<start>",
+      "-t", "<duration>",
+      ...resolved.hwaccelArgs,
+      "-i", "<input>",
+      "-vf", resolved.name.endsWith("_qsv")
+        ? "scale_qsv=w=<w>:h=<h>:format=nv12"
+        : "scale=<w>:<h>:flags=lanczos",
+      "-r", "30",
+      ...resolved.codecArgs,
+      ...(resolved.name.endsWith("_qsv") ? ["-async_depth", "2"] : []),
+      "-c:a", "aac",
+      "-b:a", "192k",
+      "-movflags", "+faststart",
+      "-progress", "pipe:1",
+      "<segment_output>",
+    ];
+    logExportEvent(
+      "ExportService",
+      `validation.command.highlight.segment preset=${preset} args=[${segmentedTemplate.join(" ")}]`,
+    );
   }
+
+  logExportEvent(
+    "ExportService",
+    "validation.command.highlight.concat args=[ffmpeg -y -f concat -safe 0 -i <segments.txt> -c copy -movflags +faststart <output>]",
+  );
 
   ffmpegPresetCommandValidationLogged = true;
 }
@@ -284,6 +320,61 @@ function buildExportConfig(
   };
 }
 
+export function mergeOverlappingSegments(
+  clips: ClipRange[],
+  videoDurationSec: number,
+  minSegmentSec = MIN_HIGHLIGHT_SEGMENT_SEC,
+): ClipRange[] {
+  const hasDurationCap = Number.isFinite(videoDurationSec) && videoDurationSec > 0;
+  const durationCap = hasDurationCap ? videoDurationSec : Number.POSITIVE_INFINITY;
+
+  const normalized = clips
+    .map((clip) => {
+      let start = Number.isFinite(clip.start_time) ? clip.start_time : 0;
+      let end = Number.isFinite(clip.end_time) ? clip.end_time : start;
+
+      if (end < start) {
+        const tmp = start;
+        start = end;
+        end = tmp;
+      }
+
+      start = Math.max(0, Math.min(start, durationCap));
+      end = Math.max(start, Math.min(end, durationCap));
+
+      if (end - start < minSegmentSec) {
+        const targetEnd = Math.min(durationCap, start + minSegmentSec);
+        const missing = minSegmentSec - (targetEnd - start);
+        const backfilledStart = Math.max(0, start - missing);
+        start = backfilledStart;
+        end = targetEnd;
+      }
+
+      return { start_time: start, end_time: end };
+    })
+    .filter((clip) => clip.end_time - clip.start_time > 0.05)
+    .sort((a, b) => a.start_time - b.start_time || a.end_time - b.end_time);
+
+  const merged: ClipRange[] = [];
+  const epsilon = 0.001;
+
+  for (const clip of normalized) {
+    const last = merged[merged.length - 1];
+    if (!last) {
+      merged.push({ ...clip });
+      continue;
+    }
+
+    if (clip.start_time <= last.end_time + epsilon) {
+      last.end_time = Math.max(last.end_time, clip.end_time);
+    } else {
+      merged.push({ ...clip });
+    }
+  }
+
+  return merged;
+}
+
 export class ExportService {
   static async cancelActiveExport(): Promise<boolean> {
     return cancelActiveFfmpeg();
@@ -332,8 +423,19 @@ export class ExportService {
       throw new Error("No video loaded");
     }
 
-    const config = buildExportConfig(videoPath, clips, outputPath, options);
-    const result = await runExport(config);
+    const mergedClips = mergeOverlappingSegments(clips, videoState.duration || 0);
+    if (mergedClips.length === 0) {
+      throw new Error("No valid highlight segments after normalization");
+    }
+
+    const config = buildExportConfig(videoPath, mergedClips, outputPath, options);
+    const segmentedConfig: ExportConfig = {
+      ...config,
+      overlays: [],
+      clips: mergedClips,
+    };
+
+    const result = await runHighlightExportSegmented(segmentedConfig);
     return attachOutputStats(result);
   }
 }

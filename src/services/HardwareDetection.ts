@@ -305,8 +305,10 @@ export function buildCodecArgs(encoder: EncoderName, profile: QualityProfile): s
     args.push(
       "-preset", preset.qsv.preset,
       "-global_quality", preset.qsv.quality,
-      "-look_ahead", preset.qsv.lookAhead ? "1" : "0",
     );
+    if (preset.qsv.lookAhead) {
+      args.push("-look_ahead", "1");
+    }
     if (encoder.startsWith("h264")) {
       args.push("-profile:v", "high");
     }
