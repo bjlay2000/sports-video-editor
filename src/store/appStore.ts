@@ -1,5 +1,27 @@
 import { create } from "zustand";
 import { Player, Play, Game, TimelineMarker, ScoreAdjustmentEvent } from "./types";
+import {
+  defaultQualityForContext,
+  type ExportQualityContext,
+  type QualityProfile,
+} from "../services/HardwareDetection";
+
+export interface ExportCompletionStats {
+  outputPath: string;
+  outputSizeBytes: number;
+  totalElapsedMs: number;
+  encodeElapsedMs: number;
+  encoder: string;
+  encoderDisplay: string;
+  vendorDisplay: string;
+  exportWidth: number;
+  exportHeight: number;
+  totalDurationSec: number;
+  totalFrames: number;
+  fps: number;
+}
+
+export type { QualityProfile } from "../services/HardwareDetection";
 
 interface AppState {
   players: Player[];
@@ -21,6 +43,15 @@ interface AppState {
   exportProgressTitle: string;
   exportProgressPercent: number;
   exportProgressStatus: string;
+  exportThumbnailUrl: string;
+  exportTimeRemaining: string;
+  exportCurrentProcess: string;
+  exportStartedAt: number;
+  exportCompletionStats: ExportCompletionStats | null;
+  exportQualityProfile: QualityProfile;
+  exportQualityUserSelected: boolean;
+  exportQualityInitializedContexts: Record<ExportQualityContext, boolean>;
+  exportEstimatedTime: string | null;
   setPlayers: (players: Player[]) => void;
   setOnCourtPlayerIds: (ids: number[]) => void;
   toggleOnCourtPlayer: (playerId: number, onCourt: boolean) => void;
@@ -48,6 +79,12 @@ interface AppState {
   setIsExporting: (exporting: boolean) => void;
   setExportProgressVisible: (visible: boolean, title?: string) => void;
   updateExportProgress: (percent: number, status?: string) => void;
+  setExportThumbnailUrl: (url: string) => void;
+  setExportCurrentProcess: (process: string) => void;
+  setExportCompletionStats: (stats: ExportCompletionStats | null) => void;
+  setExportQualityProfile: (profile: QualityProfile, source?: "user" | "system") => void;
+  initializeExportQualityForContext: (context: ExportQualityContext) => void;
+  setExportEstimatedTime: (time: string | null) => void;
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -70,6 +107,18 @@ export const useAppStore = create<AppState>((set) => ({
   exportProgressTitle: "",
   exportProgressPercent: 0,
   exportProgressStatus: "",
+  exportThumbnailUrl: "",
+  exportTimeRemaining: "",
+  exportCurrentProcess: "",
+  exportStartedAt: 0,
+  exportCompletionStats: null,
+  exportQualityProfile: "fast" as QualityProfile,
+  exportQualityUserSelected: false,
+  exportQualityInitializedContexts: {
+    highlights: false,
+    full: false,
+  },
+  exportEstimatedTime: null as string | null,
   setPlayers: (players) =>
     set((state) => {
       const validIds = new Set(players.map((p) => p.id));
@@ -164,12 +213,69 @@ export const useAppStore = create<AppState>((set) => ({
       exportProgressTitle: title,
       exportProgressPercent: visible ? 0 : 0,
       exportProgressStatus: visible ? "Starting export..." : "",
+      exportThumbnailUrl: visible ? useAppStore.getState().exportThumbnailUrl : "",
+      exportTimeRemaining: "",
+      exportCurrentProcess: "",
+      exportStartedAt: visible ? Date.now() : 0,
+      exportCompletionStats: visible ? null : null,
     }),
   updateExportProgress: (percent, status) =>
-    set((state) => ({
-      exportProgressPercent: Number.isFinite(percent)
+    set((state) => {
+      const now = Date.now();
+      const clampedPercent = Number.isFinite(percent)
         ? Math.max(0, Math.min(100, percent))
-        : state.exportProgressPercent,
-      exportProgressStatus: status ?? state.exportProgressStatus,
+        : state.exportProgressPercent;
+
+      // Calculate time remaining based on progress rate
+      let timeRemaining = state.exportTimeRemaining;
+      const startedAt = state.exportStartedAt || now;
+      if (clampedPercent > 1 && clampedPercent < 100) {
+        const elapsed = (now - startedAt) / 1000;
+        if (elapsed > 2 && clampedPercent > 0.5) {
+          const pctPerSec = clampedPercent / elapsed;
+          const remaining = (100 - clampedPercent) / pctPerSec;
+          const h = Math.floor(remaining / 3600);
+          const m = Math.floor((remaining % 3600) / 60);
+          const s = Math.floor(remaining % 60);
+          timeRemaining = `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+        }
+      } else if (clampedPercent >= 100) {
+        timeRemaining = "00:00:00";
+      }
+
+      return {
+        exportProgressPercent: clampedPercent,
+        exportProgressStatus: status ?? state.exportProgressStatus,
+        exportTimeRemaining: timeRemaining,
+      };
+    }),
+  setExportThumbnailUrl: (url) => set({ exportThumbnailUrl: url }),
+  setExportCurrentProcess: (process) => set({ exportCurrentProcess: process }),
+  setExportCompletionStats: (stats) => set({ exportCompletionStats: stats }),
+  setExportQualityProfile: (profile, source = "user") =>
+    set((state) => ({
+      exportQualityProfile: profile,
+      exportQualityUserSelected: source === "user" ? true : state.exportQualityUserSelected,
     })),
+  initializeExportQualityForContext: (context) =>
+    set((state) => {
+      if (state.exportQualityInitializedContexts[context]) {
+        return {};
+      }
+
+      const nextInitialized = {
+        ...state.exportQualityInitializedContexts,
+        [context]: true,
+      };
+
+      if (state.exportQualityUserSelected) {
+        return { exportQualityInitializedContexts: nextInitialized };
+      }
+
+      return {
+        exportQualityProfile: defaultQualityForContext(context),
+        exportQualityInitializedContexts: nextInitialized,
+      };
+    }),
+  setExportEstimatedTime: (time) => set({ exportEstimatedTime: time }),
 }));

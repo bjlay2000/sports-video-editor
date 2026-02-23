@@ -3,6 +3,11 @@ import { useVideoStore } from "../store/videoStore";
 import { useTimelineStore } from "../store/timelineStore";
 import { MediaProcessingService, type TimelineAssets } from "./MediaProcessingService";
 import { ThumbnailCaptureService } from "./ThumbnailCaptureService";
+import {
+  createCancelToken,
+  cancelFfmpegToken,
+  type FfmpegCancelToken,
+} from "./FfmpegService";
 
 const SUPPORTED_EXTENSIONS = [".mp4", ".mov", ".mkv"];
 
@@ -14,6 +19,9 @@ const clipId = () =>
 const basename = (path: string) => path.split(/[/\\]/).pop() ?? path;
 
 export class MediaLibrary {
+  /** Cancel token for the currently running background generation. */
+  private static activeCancelToken: FfmpegCancelToken | null = null;
+
   static isSupported(path: string) {
     const lower = path.toLowerCase();
     return SUPPORTED_EXTENSIONS.some((ext) => lower.endsWith(ext));
@@ -50,12 +58,22 @@ export class MediaLibrary {
         waveformSrc: clip.assets.waveformSrc,
       });
       timeline.setAssetsLoading(false);
+      timeline.setThumbnailsGenerating(false);
     } else {
       timeline.setTimelineAssets({ thumbnails: [], waveformSrc: null });
-      timeline.setAssetsLoading(true);
+      timeline.setAssetsLoading(false);
+      timeline.setThumbnailsGenerating(false);
     }
   }
 
+  /**
+   * Non-blocking hydration: the timeline is immediately interactive once
+   * duration is known.  Thumbnails & waveform are generated in the background
+   * and streamed progressively to the timeline store.
+   *
+   * If a new clip is loaded while generation is running, the previous
+   * generation is cancelled via its cancel token.
+   */
   static async hydrateActiveClip(videoElement: HTMLVideoElement, duration: number) {
     const videoState = useVideoStore.getState();
     const timeline = useTimelineStore.getState();
@@ -66,6 +84,7 @@ export class MediaLibrary {
     videoState.setDuration(duration);
     videoState.updateClip(activeClipId, { duration });
 
+    // ── Fast path: assets already cached ──
     const existingClip = videoState.clips.find((clip) => clip.id === activeClipId);
     const existingAssets = existingClip?.assets;
     if (existingAssets && (existingAssets.thumbnails.length > 0 || Boolean(existingAssets.waveformSrc))) {
@@ -74,23 +93,38 @@ export class MediaLibrary {
         waveformSrc: existingAssets.waveformSrc,
       });
       timeline.setAssetsLoading(false);
+      timeline.setThumbnailsGenerating(false);
       return;
     }
 
-    timeline.setAssetsLoading(true);
+    // ── Non-blocking: timeline is interactive immediately ──
+    timeline.setAssetsLoading(false);
+    timeline.setThumbnailsGenerating(true);
+
+    // Cancel any previous in-flight generation
+    if (MediaLibrary.activeCancelToken) {
+      cancelFfmpegToken(MediaLibrary.activeCancelToken);
+    }
+    const cancelToken = createCancelToken();
+    MediaLibrary.activeCancelToken = cancelToken;
+
+    const generationClipId = activeClipId;
+
+    /** Check whether this generation is still relevant. */
+    const isStale = () =>
+      cancelToken.cancelled ||
+      useVideoStore.getState().activeClipId !== generationClipId;
 
     const applyAssets = (assets: TimelineAssets) => {
-      if (useVideoStore.getState().activeClipId !== activeClipId) {
-        return false;
-      }
-      videoState.updateClip(activeClipId, {
+      if (isStale()) return false;
+      useVideoStore.getState().updateClip(generationClipId, {
         thumbnail: assets.poster ?? assets.thumbnails[0]?.src ?? undefined,
         assets: {
           thumbnails: assets.thumbnails,
           waveformSrc: assets.waveformSrc,
         },
       });
-      timeline.setTimelineAssets({
+      useTimelineStore.getState().setTimelineAssets({
         thumbnails: assets.thumbnails,
         waveformSrc: assets.waveformSrc,
       });
@@ -99,21 +133,41 @@ export class MediaLibrary {
 
     let assetsApplied = false;
 
+    // ── Background generation with progressive streaming ──
     try {
       const assets = await MediaProcessingService.generateTimelineAssets(
         videoPath,
-        duration
+        duration,
+        {
+          cancelToken,
+          onThumbnailsUpdate: (thumbs) => {
+            if (isStale()) return;
+            useTimelineStore.getState().setThumbnails(thumbs);
+          },
+          onWaveform: (src) => {
+            if (isStale()) return;
+            const current = useTimelineStore.getState();
+            current.setTimelineAssets({
+              thumbnails: current.thumbnails,
+              waveformSrc: src,
+            });
+          },
+        },
       );
+
       assetsApplied = applyAssets(assets);
     } catch (err) {
-      console.warn("FFmpeg thumbnail generation failed, attempting fallback", err);
+      if (!isStale()) {
+        console.warn("FFmpeg thumbnail generation failed, attempting fallback", err);
+      }
     }
 
-    if (!assetsApplied) {
+    // ── Canvas-based fallback if ffmpeg failed ──
+    if (!assetsApplied && !isStale()) {
       try {
         const thumbnails = await ThumbnailCaptureService.captureFromVideo(
           videoElement,
-          duration
+          duration,
         );
         if (thumbnails.length > 0) {
           const fallbackAssets: TimelineAssets = {
@@ -121,13 +175,19 @@ export class MediaLibrary {
             waveformSrc: null,
             poster: thumbnails[0]?.src,
           };
-          assetsApplied = applyAssets(fallbackAssets);
+          applyAssets(fallbackAssets);
         }
-      } catch (err) {
-        console.error("Failed to capture inline thumbnails", err);
+      } catch (fallbackErr) {
+        console.error("Failed to capture inline thumbnails", fallbackErr);
       }
     }
 
-    timeline.setAssetsLoading(false);
+    // ── Cleanup ──
+    if (!isStale()) {
+      useTimelineStore.getState().setThumbnailsGenerating(false);
+    }
+    if (MediaLibrary.activeCancelToken === cancelToken) {
+      MediaLibrary.activeCancelToken = null;
+    }
   }
 }

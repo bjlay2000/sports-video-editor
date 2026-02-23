@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useAppStore } from "../../store/appStore";
 import { useVideoStore } from "../../store/videoStore";
 import { useToastStore } from "../../store/toastStore";
 import { ExportService } from "../../services/ExportService";
+import { logExportEvent } from "../../services/ExportLogService";
 import { StatType } from "../../store/types";
 import { save } from "@tauri-apps/plugin-dialog";
 
@@ -21,8 +22,16 @@ export function HighlightExportModal() {
   const setIsExporting = useAppStore((s) => s.setIsExporting);
   const setExportProgressVisible = useAppStore((s) => s.setExportProgressVisible);
   const updateExportProgress = useAppStore((s) => s.updateExportProgress);
+  const setExportThumbnailUrl = useAppStore((s) => s.setExportThumbnailUrl);
+  const setExportCurrentProcess = useAppStore((s) => s.setExportCurrentProcess);
+  const setExportCompletionStats = useAppStore((s) => s.setExportCompletionStats);
+  const initializeExportQualityForContext = useAppStore((s) => s.initializeExportQualityForContext);
   const videoPath = useVideoStore((s) => s.videoPath);
   const pushToast = useToastStore((s) => s.pushToast);
+
+  useEffect(() => {
+    initializeExportQualityForContext("highlights");
+  }, [initializeExportQualityForContext]);
 
   const allSelected = selected.size === ALL_STAT_TYPES.length;
   const allPlayersSelected = players.length > 0 && selectedPlayers.size === players.length;
@@ -58,7 +67,11 @@ export function HighlightExportModal() {
   };
 
   const handleExport = async () => {
-    if (selected.size === 0 || !videoPath) return;
+    logExportEvent("HighlightExportModal", "handleExport: click");
+    if (selected.size === 0 || !videoPath) {
+      logExportEvent("HighlightExportModal", "handleExport: aborted (no selected stats or videoPath)");
+      return;
+    }
 
     const types = Array.from(selected);
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -70,6 +83,7 @@ export function HighlightExportModal() {
     });
 
     if (!savePath) {
+      logExportEvent("HighlightExportModal", "handleExport: user cancelled save dialog");
       return;
     }
 
@@ -79,7 +93,21 @@ export function HighlightExportModal() {
 
     setExporting(true);
     setIsExporting(true);
+    logExportEvent("HighlightExportModal", `handleExport: export start output=${normalizedPath}`);
+    // Capture thumbnail from video element
+    const videoEl = document.querySelector("video");
+    if (videoEl) {
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = videoEl.videoWidth || 640;
+        canvas.height = videoEl.videoHeight || 360;
+        const ctx = canvas.getContext("2d");
+        ctx?.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+        setExportThumbnailUrl(canvas.toDataURL("image/jpeg", 0.7));
+      } catch { /* ignore cross-origin or empty video */ }
+    }
     setExportProgressVisible(true, "Exporting Highlights");
+    let completed = false;
     try {
       const selectedPlayerIds = new Set(selectedPlayers);
       const clips = plays
@@ -88,24 +116,59 @@ export function HighlightExportModal() {
         .map((p) => ({ start_time: p.start_time, end_time: p.end_time }));
 
       if (clips.length === 0) {
+        logExportEvent("HighlightExportModal", "handleExport: aborted (no clips matched filters)");
         pushToast("No clips found for selected stat types", "info");
         return;
       }
 
-      await ExportService.exportHighlights(videoPath, clips, normalizedPath, {
+      const result = await ExportService.exportHighlights(videoPath, clips, normalizedPath, {
         onProgress: (update) => {
+          logExportEvent(
+            "HighlightExportModal",
+            `handleExport:onProgress percent=${update.percent.toFixed(2)} status=${update.status ?? ""}`,
+          );
           updateExportProgress(update.percent, update.status);
         },
+        onProcessChange: (process) => {
+          logExportEvent("HighlightExportModal", `handleExport:onProcessChange ${process}`);
+          setExportCurrentProcess(process);
+        },
       });
+      setExportCompletionStats({
+        outputPath: result.outputPath,
+        outputSizeBytes: result.outputSizeBytes,
+        totalElapsedMs: result.totalElapsedMs,
+        encodeElapsedMs: result.encodeElapsedMs,
+        encoder: result.encoder,
+        encoderDisplay: result.encoderDisplay,
+        vendorDisplay: result.vendorDisplay,
+        exportWidth: result.exportWidth,
+        exportHeight: result.exportHeight,
+        totalDurationSec: result.totalDurationSec,
+        totalFrames: result.totalFrames,
+        fps: result.fps,
+      });
+      completed = true;
+      logExportEvent("HighlightExportModal", "handleExport: export complete");
       pushToast("Highlight export complete", "success");
       setShowHighlightModal(false);
     } catch (e: any) {
       console.error(e);
-      pushToast(`Export failed: ${e?.message ?? e}`, "error");
+      const message = String(e?.message ?? e ?? "");
+      logExportEvent("HighlightExportModal", `handleExport: export error ${message}`);
+      if (message.toLowerCase().includes("cancelled")) {
+        pushToast("Export cancelled", "info");
+      } else {
+        pushToast(`Export failed: ${message}`, "error");
+      }
     } finally {
+      logExportEvent("HighlightExportModal", "handleExport: cleanup/finalize");
       setExporting(false);
       setIsExporting(false);
-      setExportProgressVisible(false);
+      if (!completed) {
+        setExportCompletionStats(null);
+        setExportProgressVisible(false);
+      }
     }
   };
 

@@ -52,6 +52,7 @@ interface Props {
   markers: TimelineMarker[];
   thumbnails: TimelineThumbnail[];
   assetsLoading: boolean;
+  thumbnailsGenerating: boolean;
   onSeek: (projectTime: number) => void;
   onMarkerClick: (marker: TimelineMarker) => void;
   selectedIds: number[];
@@ -121,6 +122,7 @@ export function TimelineRenderer({
   markers,
   thumbnails,
   assetsLoading,
+  thumbnailsGenerating,
   onSeek,
   onMarkerClick,
   selectedIds,
@@ -533,7 +535,11 @@ export function TimelineRenderer({
     if (usableThumbs.length === 0) {
       return (
         <div className="flex h-full w-full items-center justify-center text-xs text-gray-600">
-          {assetsLoading ? "Generating preview frames…" : "Load a clip to see preview thumbnails"}
+          {thumbnailsGenerating
+            ? "Generating preview frames…"
+            : duration > 0
+              ? "Preview frames loading…"
+              : "Load a clip to see preview thumbnails"}
         </div>
       );
     }
@@ -657,9 +663,10 @@ export function TimelineRenderer({
             </button>
           </div>
         </div>
-        {assetsLoading && (
-          <div className="absolute inset-0 flex items-center justify-center rounded-2xl bg-black/60 text-sm text-gray-300">
-            Syncing video intelligence…
+        {thumbnailsGenerating && thumbnails.length === 0 && (
+          <div className="absolute bottom-2 left-1/2 z-10 -translate-x-1/2 rounded-full bg-black/70 px-3 py-1 text-xs text-gray-400 shadow-lg">
+            <span className="mr-1.5 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
+            Generating preview frames…
           </div>
         )}
       </div>

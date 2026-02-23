@@ -64,6 +64,7 @@ export function TimelinePanel() {
   const setPlayheadTime = useTimelineStore((s) => s.setPlayheadTime);
   const thumbnails = useTimelineStore((s) => s.thumbnails);
   const assetsLoading = useTimelineStore((s) => s.assetsLoading);
+  const thumbnailsGenerating = useTimelineStore((s) => s.thumbnailsGenerating);
   const zoomIn = useTimelineStore((s) => s.zoomIn);
   const zoomOut = useTimelineStore((s) => s.zoomOut);
   const selectedMarkerIds = useTimelineStore((s) => s.selectedMarkerIds);
@@ -606,6 +607,7 @@ export function TimelinePanel() {
               markers={markers}
               thumbnails={thumbnails}
               assetsLoading={assetsLoading}
+              thumbnailsGenerating={thumbnailsGenerating}
               onSeek={handleSeek}
               onMarkerClick={handleMarkerClick}
               selectedIds={selectedMarkerIds}
