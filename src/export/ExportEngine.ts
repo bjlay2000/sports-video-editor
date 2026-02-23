@@ -101,6 +101,332 @@ export interface ExportResult {
   totalElapsedMs: number;
 }
 
+/* ================================================================
+ *  Highlight export (segmented architecture)
+ *
+ *  Why this exists:
+ *  - The previous highlight architecture decoded the full source timeline
+ *    and trimmed in a giant filtergraph (trim/atrim + concat).
+ *  - On long videos with many highlights, that graph can increase GPU memory
+ *    pressure and trigger stalls/freezes.
+ *
+ *  New approach:
+ *  1) Seek each highlight segment via input seeking (-ss before -i)
+ *  2) Encode each segment independently to temp MP4 files
+ *  3) Concatenate with concat demuxer using -c copy (no re-encode)
+ *
+ *  This decodes only needed ranges, reduces VRAM pressure, and keeps
+ *  QSV acceleration + quality controls.
+ * ================================================================ */
+
+interface HighlightSegment {
+  start: number;
+  end: number;
+}
+
+function formatSec(value: number): string {
+  return Math.max(0, value).toFixed(6);
+}
+
+function concatFilePath(path: string): string {
+  const normalized = path.replace(/\\/g, "/");
+  return normalized.replace(/'/g, "'\\''");
+}
+
+function applyQsvSegmentTunables(codecArgs: string[], isQsv: boolean): string[] {
+  if (!isQsv) return [...codecArgs];
+
+  const args = [...codecArgs];
+  const hasAsyncDepth = args.includes("-async_depth");
+
+  if (!hasAsyncDepth) {
+    args.push("-async_depth", "2");
+  }
+
+  return args;
+}
+
+function buildSegmentArgs(params: {
+  videoPath: string;
+  startSec: number;
+  durationSec: number;
+  exportWidth: number;
+  exportHeight: number;
+  fps: number;
+  encoder: ResolvedEncoder;
+  outputPath: string;
+}): string[] {
+  const {
+    videoPath,
+    startSec,
+    durationSec,
+    exportWidth,
+    exportHeight,
+    fps,
+    encoder,
+    outputPath,
+  } = params;
+
+  const isQsvEncoder = encoder.name.endsWith("_qsv");
+  const codecArgs = applyQsvSegmentTunables(encoder.codecArgs, isQsvEncoder);
+
+  const args: string[] = ["-y"];
+
+  args.push("-ss", formatSec(startSec));
+  args.push("-t", formatSec(durationSec));
+
+  if (isQsvEncoder) {
+    args.push("-hwaccel", "qsv", "-hwaccel_output_format", "qsv");
+  } else if (encoder.hwaccelArgs.length > 0) {
+    args.push(...encoder.hwaccelArgs);
+  }
+
+  args.push("-i", videoPath);
+
+  if (isQsvEncoder) {
+    args.push("-vf", `scale_qsv=w=${exportWidth}:h=${exportHeight}:format=nv12`);
+  } else {
+    args.push("-vf", `scale=${exportWidth}:${exportHeight}:flags=lanczos`);
+    args.push("-pix_fmt", "yuv420p");
+  }
+
+  args.push("-r", String(fps));
+  args.push(...codecArgs);
+  args.push("-c:a", "aac", "-b:a", "192k");
+  args.push("-movflags", "+faststart");
+  args.push("-progress", "pipe:1");
+  args.push(outputPath);
+
+  return args;
+}
+
+export async function runHighlightExportSegmented(config: ExportConfig): Promise<ExportResult> {
+  exportLogEntries.length = 0;
+  onProcessChange = config.onProcessChange ?? null;
+  beginExportLogSession(`output=${config.outputPath} mode=segmented-highlights`);
+  const exportStartedAt = Date.now();
+
+  const {
+    videoPath,
+    clips,
+    overlays,
+    outputPath,
+    exportWidth,
+    exportHeight,
+    fps,
+    qualityProfile = "fast",
+    onProgress,
+  } = config;
+
+  let tempDir: string | null = null;
+  let concatListPath: string | null = null;
+  const segmentFiles: string[] = [];
+  let concatCompleted = false;
+
+  try {
+    exportLog("runHighlightExportSegmented: === EXPORT STARTED ===");
+
+    if (overlays.length > 0) {
+      throw new Error("Highlight export with overlays is not supported in segmented mode");
+    }
+
+    if (clips.length === 0) {
+      throw new Error("No highlight segments to export");
+    }
+
+    const totalDuration = clips.reduce(
+      (sum, clip) => sum + Math.max(0, clip.end_time - clip.start_time),
+      0,
+    );
+    const totalFrames = Math.ceil(totalDuration * fps);
+    if (totalFrames <= 0) {
+      throw new Error("No frames to export");
+    }
+
+    onProgress?.(0, "Preparing highlight export...");
+
+    exportLog(`runHighlightExportSegmented: resolving encoder for profile=${qualityProfile}`);
+    const encoder = await resolveEncoder(qualityProfile);
+    const encoderLabel = encoderDisplayName(encoder.name);
+    const vendorLabel = vendorDisplayName(encoder.vendor);
+    const qsvActive = encoder.name.endsWith("_qsv");
+    exportLog(
+      `runHighlightExportSegmented: encoder=${encoder.name} (${encoderLabel}) vendor=${vendorLabel} qsvActive=${qsvActive}`,
+    );
+
+    onProgress?.(3, `Detected: ${encoderLabel} (${vendorLabel})`);
+
+    const cacheRoot = await appCacheDir();
+    tempDir = await join(cacheRoot, OVERLAY_CACHE_DIR, `highlight-segments-${Date.now()}`);
+    await mkdir(tempDir, { recursive: true });
+
+    const segmentSpecs: HighlightSegment[] = clips.map((clip) => ({
+      start: clip.start_time,
+      end: clip.end_time,
+    }));
+
+    exportLog(`runHighlightExportSegmented: encoding ${segmentSpecs.length} segments`);
+    const encodeStartedAt = Date.now();
+
+    const segmentTotalDuration = segmentSpecs.reduce((sum, s) => sum + (s.end - s.start), 0);
+    let segmentEncodedDuration = 0;
+
+    for (let index = 0; index < segmentSpecs.length; index++) {
+      const segment = segmentSpecs[index];
+      const segmentDuration = Math.max(0.001, segment.end - segment.start);
+      const segmentPath = await join(
+        tempDir,
+        `temp_segment_${String(index + 1).padStart(3, "0")}.mp4`,
+      );
+      segmentFiles.push(segmentPath);
+
+      exportLog(
+        `runHighlightExportSegmented: segment ${index + 1}/${segmentSpecs.length} start=${segment.start.toFixed(3)} end=${segment.end.toFixed(3)} duration=${segmentDuration.toFixed(3)}s`,
+      );
+      onProgress?.(
+        Math.min(90, 5 + (segmentEncodedDuration / segmentTotalDuration) * 85),
+        `Encoding segment ${index + 1}/${segmentSpecs.length}`,
+      );
+
+      let segmentOutSeconds = 0;
+
+      await runFfmpeg(
+        buildSegmentArgs({
+          videoPath,
+          startSec: segment.start,
+          durationSec: segmentDuration,
+          exportWidth,
+          exportHeight,
+          fps,
+          encoder,
+          outputPath: segmentPath,
+        }),
+        {
+          onProgress: (payload) => {
+            if (payload.key === "out_time_us" || payload.key === "out_time_ms") {
+              const parsed = Number.parseInt(payload.value, 10);
+              if (Number.isFinite(parsed) && parsed > 0) {
+                const outSec = parsed / 1_000_000;
+                if (outSec > segmentOutSeconds) {
+                  segmentOutSeconds = outSec;
+                }
+
+                const currentGlobalDuration = Math.min(
+                  segmentTotalDuration,
+                  segmentEncodedDuration + Math.min(segmentDuration, segmentOutSeconds),
+                );
+                const percent = Math.min(94, 5 + (currentGlobalDuration / segmentTotalDuration) * 89);
+                onProgress?.(
+                  percent,
+                  `Encoding segment ${index + 1}/${segmentSpecs.length} (${Math.min(100, (segmentOutSeconds / segmentDuration) * 100).toFixed(0)}%)`,
+                );
+              }
+            }
+          },
+          stallTimeoutMs: 90_000,
+        },
+      );
+
+      segmentEncodedDuration += segmentDuration;
+      onProgress?.(
+        Math.min(94, 5 + (segmentEncodedDuration / segmentTotalDuration) * 89),
+        `Segment ${index + 1}/${segmentSpecs.length} complete`,
+      );
+    }
+
+    if (segmentFiles.length === 0) {
+      throw new Error("No segment files were generated");
+    }
+
+    exportLog("runHighlightExportSegmented: building concat list");
+    concatListPath = await join(tempDir, "segments.txt");
+    const concatBody = segmentFiles
+      .map((filePath) => `file '${concatFilePath(filePath)}'`)
+      .join("\n");
+    await writeFile(concatListPath, new TextEncoder().encode(`${concatBody}\n`));
+
+    exportLog("runHighlightExportSegmented: concatenating segments via demuxer (-c copy)");
+    onProgress?.(95, "Concatenating segments...");
+
+    await runFfmpeg(
+      [
+        "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", concatListPath,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        "-progress", "pipe:1",
+        outputPath,
+      ],
+      {
+        onProgress: (payload) => {
+          if (payload.key === "progress" && payload.value === "end") {
+            onProgress?.(100, "Export complete");
+          }
+        },
+        stallTimeoutMs: 60_000,
+      },
+    );
+
+    concatCompleted = true;
+
+    const totalElapsedMs = Date.now() - exportStartedAt;
+    const encodeElapsedMs = Date.now() - encodeStartedAt;
+    exportLog(`runHighlightExportSegmented: === EXPORT FINISHED === total=${totalElapsedMs}ms`);
+    endExportLogSession(`output=${outputPath}`);
+
+    return {
+      outputPath,
+      totalDurationSec: totalDuration,
+      totalFrames,
+      fps,
+      exportWidth,
+      exportHeight,
+      encoder: encoder.name,
+      encoderDisplay: encoderLabel,
+      vendorDisplay: vendorLabel,
+      encodeElapsedMs,
+      totalElapsedMs,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    exportLog(`runHighlightExportSegmented: === EXPORT FAILED === ${message}`);
+    endExportLogSession(`output=${outputPath} status=failed`);
+    throw error;
+  } finally {
+    if (concatCompleted) {
+      for (const segmentPath of segmentFiles) {
+        try {
+          await remove(segmentPath);
+        } catch {
+          /* ignore cleanup failures */
+        }
+      }
+      if (concatListPath) {
+        try {
+          await remove(concatListPath);
+        } catch {
+          /* ignore cleanup failures */
+        }
+      }
+      if (tempDir) {
+        try {
+          await remove(tempDir, { recursive: true });
+        } catch {
+          /* ignore cleanup failures */
+        }
+      }
+    } else {
+      if (tempDir) {
+        exportLog(`runHighlightExportSegmented: temp files retained for diagnostics at ${tempDir}`);
+      }
+    }
+
+    onProcessChange = null;
+  }
+}
+
 
 
 /* ================================================================
