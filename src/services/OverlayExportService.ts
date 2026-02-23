@@ -36,6 +36,7 @@ export async function createOverlayCompositeFile(): Promise<{
   const scoreEvents = deriveScoreEvents(
     appState.plays,
     appState.opponentScoreEvents,
+    appState.homeScoreEvents,
   );
 
   const timelineModel: TimelineModel = {

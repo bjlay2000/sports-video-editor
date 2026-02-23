@@ -57,6 +57,7 @@ export function VideoPlayer() {
   const setPlayheadTime = useTimelineStore((s) => s.setPlayheadTime);
   const plays = useAppStore((s) => s.plays);
   const opponentScoreEvents = useAppStore((s) => s.opponentScoreEvents);
+  const homeScoreEvents = useAppStore((s) => s.homeScoreEvents);
   const duration = useVideoStore((s) => s.duration);
   const videoWidth = useVideoStore((s) => s.videoWidth);
   const videoHeight = useVideoStore((s) => s.videoHeight);
@@ -262,8 +263,8 @@ export function VideoPlayer() {
 
   // ---- Unified render pipeline ----
   const scoreEvents = useMemo(
-    () => deriveScoreEvents(plays, opponentScoreEvents),
-    [plays, opponentScoreEvents],
+    () => deriveScoreEvents(plays, opponentScoreEvents, homeScoreEvents),
+    [plays, opponentScoreEvents, homeScoreEvents],
   );
 
   const timelineModel = useMemo<TimelineModel>(

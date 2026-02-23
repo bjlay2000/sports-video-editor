@@ -2,6 +2,8 @@
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -83,18 +85,147 @@ pub fn init_db(conn: &Connection) {
     }
 }
 
-// ---- COMMANDS ----
+fn monitor_log_candidates() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("ffmpeg-monitor.log"));
+        if let Some(parent) = cwd.parent() {
+            candidates.push(parent.join("ffmpeg-monitor.log"));
+        }
+    }
+    candidates
+}
+
+fn resolve_monitor_log_path() -> Option<PathBuf> {
+    let candidates = monitor_log_candidates();
+    candidates
+        .iter()
+        .find(|p| p.exists())
+        .cloned()
+        .or_else(|| candidates.first().cloned())
+}
+
+fn reset_ffmpeg_monitor_log() {
+    let now = chrono_like_now();
+    let header = format!(
+        "=== monitor started {} (reset on app launch) ===\n",
+        now
+    );
+
+    // Prefer truncating an existing monitor log, otherwise create one in current dir.
+    let target = resolve_monitor_log_path();
+
+    if let Some(path) = target {
+        match OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                let _ = file.write_all(header.as_bytes());
+                let _ = file.flush();
+                println!("[startup] reset monitor log: {}", path.display());
+            }
+            Err(err) => {
+                eprintln!(
+                    "[startup] failed to reset monitor log {}: {}",
+                    path.display(),
+                    err
+                );
+            }
+        }
+    }
+}
+
+fn chrono_like_now() -> String {
+    // RFC3339-style enough for diagnostics without adding external crates.
+    // Example: 2026-02-23T10:14:12.123Z
+    let now = std::time::SystemTime::now();
+    let datetime: chrono_like::DateTime = now.into();
+    datetime.to_string()
+}
+
+mod chrono_like {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    pub struct DateTime {
+        pub year: i32,
+        pub month: u32,
+        pub day: u32,
+        pub hour: u32,
+        pub minute: u32,
+        pub second: u32,
+        pub millis: u32,
+    }
+
+    impl From<SystemTime> for DateTime {
+        fn from(value: SystemTime) -> Self {
+            let duration = value
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::from_secs(0));
+            let secs = duration.as_secs() as i64;
+            let millis = duration.subsec_millis();
+
+            // UTC conversion based on civil-from-days algorithm.
+            let days = secs.div_euclid(86_400);
+            let sod = secs.rem_euclid(86_400);
+
+            let z = days + 719_468;
+            let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+            let doe = z - era * 146_097;
+            let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+            let mut year = (yoe + era * 400) as i32;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+            let month = (mp + if mp < 10 { 3 } else { -9 }) as u32;
+            if month <= 2 {
+                year += 1;
+            }
+
+            let hour = (sod / 3600) as u32;
+            let minute = ((sod % 3600) / 60) as u32;
+            let second = (sod % 60) as u32;
+
+            DateTime {
+                year,
+                month,
+                day,
+                hour,
+                minute,
+                second,
+                millis,
+            }
+        }
+    }
+
+    impl std::fmt::Display for DateTime {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+                self.year,
+                self.month,
+                self.day,
+                self.hour,
+                self.minute,
+                self.second,
+                self.millis
+            )
+        }
+    }
+}
 
 mod commands {
-    use super::{ClipRange, DbState, Game, Play, Player};
+    use super::{resolve_monitor_log_path, ClipRange, DbState, Game, Play, Player};
     use rusqlite::params;
     use std::{
         fs,
-        io::{BufRead, BufReader},
+        io::{BufRead, BufReader, Write},
         process::{Command, Stdio},
     };
     use tauri::{async_runtime, Emitter, State};
-    use serde_json::json;
 
     #[tauri::command]
     pub fn add_player(
@@ -105,7 +236,7 @@ mod commands {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT INTO players (name, number) VALUES (?1, ?2)",
-            rusqlite::params![name, number],
+            params![name, number],
         )
         .map_err(|e| e.to_string())?;
 
@@ -141,6 +272,23 @@ mod commands {
         path.push("exports");
         fs::create_dir_all(&path).map_err(|e| e.to_string())?;
         Ok(path.to_string_lossy().to_string())
+    }
+
+    #[tauri::command]
+    pub fn append_ffmpeg_monitor_log(line: String) -> Result<(), String> {
+        let Some(path) = resolve_monitor_log_path() else {
+            return Err("Unable to resolve ffmpeg-monitor.log path".into());
+        };
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| e.to_string())?;
+
+        writeln!(file, "{}", line).map_err(|e| e.to_string())?;
+        file.flush().map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     #[tauri::command]
@@ -426,76 +574,47 @@ mod commands {
 
     #[tauri::command]
     pub async fn run_ffmpeg(
-        app_handle: tauri::AppHandle,
+        app: tauri::AppHandle,
         program: String,
         args: Vec<String>,
         progress_event: Option<String>,
     ) -> Result<String, String> {
-        const ALLOWED: [&str; 2] = ["ffmpeg", "ffmpeg.exe"];
-        let exec_name = ALLOWED
-            .iter()
-            .find(|allowed| allowed.eq_ignore_ascii_case(program.as_str()))
-            .ok_or_else(|| "Program not permitted".to_string())?
-            .to_string();
-        let ffmpeg_args = args;
-        let event_name = progress_event.clone();
-        let handle = app_handle.clone();
+        let result = async_runtime::spawn_blocking(move || -> Result<(), String> {
+            let mut child = Command::new(program)
+                .args(args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| e.to_string())?;
 
-        let output = async_runtime::spawn_blocking(move || {
-            let mut command = Command::new(exec_name);
-            command.args(&ffmpeg_args);
-            if event_name.is_some() {
-                command.stdout(Stdio::piped());
-            }
-            command.stderr(Stdio::piped());
-
-            let mut child = command.spawn()?;
-
-            if let Some(event_label) = event_name {
-                if let Some(stdout) = child.stdout.take() {
-                    let mut reader = BufReader::new(stdout);
-                    let emitter = handle.clone();
-                    std::thread::spawn(move || {
-                        let mut line = String::new();
-                        loop {
-                            line.clear();
-                            match reader.read_line(&mut line) {
-                                Ok(0) => break,
-                                Ok(_) => {
-                                    let trimmed = line.trim();
-                                    if trimmed.is_empty() {
-                                        continue;
-                                    }
-                                    if let Some((key, value)) = trimmed.split_once('=') {
-                                        let payload = json!({
-                                            "key": key,
-                                            "value": value,
-                                        });
-                                        let _ = emitter.emit(&event_label, payload);
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                    });
+            if let Some(stdout) = child.stdout.take() {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines() {
+                    let line = line.map_err(|e| e.to_string())?;
+                    if let Some(event_name) = &progress_event {
+                        let _ = app.emit(event_name, line.clone());
+                    }
                 }
             }
 
-            child.wait_with_output()
+            let status = child.wait().map_err(|e| e.to_string())?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!("ffmpeg exited with status: {}", status))
+            }
         })
         .await
-        .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
 
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
-        } else {
-            Err(String::from_utf8_lossy(&output.stderr).to_string())
-        }
+        result?;
+        Ok("ffmpeg completed".into())
     }
 }
 
 fn main() {
+    reset_ffmpeg_monitor_log();
+
     let db_path = get_db_path();
     let conn = Connection::open(&db_path).expect("Failed to open database");
     init_db(&conn);
@@ -517,6 +636,7 @@ fn main() {
             commands::update_score,
             commands::get_game,
             commands::ensure_exports_dir,
+            commands::append_ffmpeg_monitor_log,
             commands::generate_ffmpeg_concat,
             commands::run_ffmpeg
         ])

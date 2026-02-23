@@ -35,6 +35,7 @@ interface MarkerBlockLayout {
   projectEnd: number;
   width: number;
   selected: boolean;
+  missTag: boolean;
   color: string;
   label: string;
   lineX: number;
@@ -51,6 +52,7 @@ interface Props {
   markers: TimelineMarker[];
   thumbnails: TimelineThumbnail[];
   assetsLoading: boolean;
+  thumbnailsGenerating: boolean;
   onSeek: (projectTime: number) => void;
   onMarkerClick: (marker: TimelineMarker) => void;
   selectedIds: number[];
@@ -107,6 +109,9 @@ const formatEventLabel = (eventType: string) => {
   }
 };
 
+const isMissEvent = (eventType: string) =>
+  eventType === "2PT_MISS" || eventType === "3PT_MISS" || eventType === "FT_MISS";
+
 export function TimelineRenderer({
   totalWidth,
   pixelsPerSecond,
@@ -117,6 +122,7 @@ export function TimelineRenderer({
   markers,
   thumbnails,
   assetsLoading,
+  thumbnailsGenerating,
   onSeek,
   onMarkerClick,
   selectedIds,
@@ -297,6 +303,7 @@ export function TimelineRenderer({
     const projectTime = sourceToProject(marker.time);
     const safeX = Math.max(0, Math.min(totalWidth, projectTime * pixelsPerSecond));
     const color = STAT_COLORS[marker.event_type] || "#38bdf8";
+    const missTag = isMissEvent(marker.event_type);
     const friendlyEvent = formatEventLabel(marker.event_type);
     const label = marker.event_type === "MARKER"
       ? marker.label ?? "Marker"
@@ -307,7 +314,11 @@ export function TimelineRenderer({
     acc.push(
       <button
         key={marker.id}
-        className="absolute flex -translate-x-1/2 -translate-y-1/2 items-center gap-1 rounded-full border border-white/10 bg-[#050512] px-3 py-1 text-[10px] uppercase tracking-wide text-gray-200 shadow-lg shadow-black/40"
+        className={`absolute flex -translate-x-1/2 -translate-y-1/2 items-center gap-1 rounded-full border px-3 py-1 text-[10px] uppercase tracking-wide shadow-lg shadow-black/40 ${
+          missTag
+            ? "border-gray-200/70 bg-transparent text-gray-300"
+            : "border-white/10 bg-[#050512] text-gray-200"
+        }`}
         style={{ left: safeX, top: "50%", zIndex: selected ? 30 : 10 }}
         data-marker-pin
         onClick={(event) => {
@@ -325,10 +336,10 @@ export function TimelineRenderer({
       >
         <span
           className="h-2 w-2 rounded-full"
-          style={{ backgroundColor: color }}
+          style={{ backgroundColor: missTag ? "#d1d5db" : color }}
         />
         {label}
-        <span className={`text-gray-500 ${selected ? "text-white" : ""}`}>
+        <span className={`${missTag ? "text-gray-300/80" : `text-gray-500 ${selected ? "text-white" : ""}`}`}>
           {formatTime(marker.time)}
         </span>
       </button>
@@ -350,6 +361,7 @@ export function TimelineRenderer({
       const projectEnd = sourceToProject(endTime);
       const width = Math.max(2, (projectEnd - projectStart) * pixelsPerSecond);
       const selected = selectedIds.includes(marker.id);
+      const missTag = isMissEvent(marker.event_type);
       const friendlyEvent = formatEventLabel(marker.event_type);
       const label = marker.event_type === "MARKER"
         ? marker.label ?? "Marker"
@@ -365,6 +377,7 @@ export function TimelineRenderer({
         projectEnd,
         width,
         selected,
+        missTag,
         color,
         label,
         lineX,
@@ -405,8 +418,10 @@ export function TimelineRenderer({
         width: entry.width,
         top: entry.row * (TAG_ROW_HEIGHT + TAG_ROW_GAP),
         height: TAG_ROW_HEIGHT,
-        borderColor: entry.color,
-        backgroundColor: hexToRgba(entry.color, entry.selected ? 0.95 : 0.8),
+        borderColor: entry.missTag ? "rgba(229, 231, 235, 0.85)" : entry.color,
+        backgroundColor: entry.missTag
+          ? "rgba(0, 0, 0, 0)"
+          : hexToRgba(entry.color, entry.selected ? 0.95 : 0.8),
         zIndex: entry.selected ? 25 : 5,
       }}
       onMouseDown={(event) => {
@@ -415,10 +430,10 @@ export function TimelineRenderer({
       }}
       onDoubleClick={() => onMarkerClick(entry.marker)}
     >
-      <span className="pointer-events-none flex-1 truncate text-[9px] text-black/70">
+      <span className={`pointer-events-none flex-1 truncate text-[9px] ${entry.missTag ? "text-gray-200/80" : "text-black/70"}`}>
         {entry.label}
       </span>
-      <span className="pointer-events-none ml-auto text-[9px] text-black/60">
+      <span className={`pointer-events-none ml-auto text-[9px] ${entry.missTag ? "text-gray-300/80" : "text-black/60"}`}>
         {formatTime(entry.marker.time)}
       </span>
       {entry.selected && (
@@ -444,7 +459,7 @@ export function TimelineRenderer({
         </>
       )}
       <div
-        className="pointer-events-none absolute w-px rounded bg-black/70"
+        className={`pointer-events-none absolute w-px rounded ${entry.missTag ? "bg-gray-200/70" : "bg-black/70"}`}
         style={{ left: entry.lineX, top: 3, bottom: 3 }}
       />
     </div>
@@ -520,7 +535,11 @@ export function TimelineRenderer({
     if (usableThumbs.length === 0) {
       return (
         <div className="flex h-full w-full items-center justify-center text-xs text-gray-600">
-          {assetsLoading ? "Generating preview frames…" : "Load a clip to see preview thumbnails"}
+          {thumbnailsGenerating
+            ? "Generating preview frames…"
+            : duration > 0
+              ? "Preview frames loading…"
+              : "Load a clip to see preview thumbnails"}
         </div>
       );
     }
@@ -644,9 +663,10 @@ export function TimelineRenderer({
             </button>
           </div>
         </div>
-        {assetsLoading && (
-          <div className="absolute inset-0 flex items-center justify-center rounded-2xl bg-black/60 text-sm text-gray-300">
-            Syncing video intelligence…
+        {thumbnailsGenerating && thumbnails.length === 0 && (
+          <div className="absolute bottom-2 left-1/2 z-10 -translate-x-1/2 rounded-full bg-black/70 px-3 py-1 text-xs text-gray-400 shadow-lg">
+            <span className="mr-1.5 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
+            Generating preview frames…
           </div>
         )}
       </div>

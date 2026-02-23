@@ -19,6 +19,7 @@ interface TimelineState {
   thumbnails: TimelineThumbnail[];
   waveformSrc: string | null;
   assetsLoading: boolean;
+  thumbnailsGenerating: boolean;
   selectedMarkerIds: number[];
   segments: TimelineSegment[];
   selectedSegmentId: string | null;
@@ -30,7 +31,9 @@ interface TimelineState {
     thumbnails: TimelineThumbnail[];
     waveformSrc: string | null;
   }) => void;
+  setThumbnails: (thumbnails: TimelineThumbnail[]) => void;
   setAssetsLoading: (loading: boolean) => void;
+  setThumbnailsGenerating: (generating: boolean) => void;
   zoomIn: () => void;
   zoomOut: () => void;
   setSelectedMarkerIds: (ids: number[]) => void;
@@ -61,6 +64,7 @@ export const useTimelineStore = create<TimelineState>((set) => ({
   thumbnails: [],
   waveformSrc: null,
   assetsLoading: false,
+  thumbnailsGenerating: false,
   selectedMarkerIds: [],
   segments: [],
   selectedSegmentId: null,
@@ -69,7 +73,9 @@ export const useTimelineStore = create<TimelineState>((set) => ({
   setScrollY: (y) => set({ scrollY: y }),
   setPlayheadTime: (time) => set({ playheadTime: time }),
   setTimelineAssets: ({ thumbnails, waveformSrc }) => set({ thumbnails, waveformSrc }),
+  setThumbnails: (thumbnails) => set({ thumbnails }),
   setAssetsLoading: (loading) => set({ assetsLoading: loading }),
+  setThumbnailsGenerating: (generating) => set({ thumbnailsGenerating: generating }),
   zoomIn: () =>
     set((state) => ({
       pixelsPerSecond: Math.min(400, state.pixelsPerSecond * 1.2),

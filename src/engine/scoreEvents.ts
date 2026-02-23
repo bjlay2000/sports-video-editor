@@ -1,5 +1,5 @@
 import type { ScoreEvent } from "./types";
-import type { Play, OpponentScoreEvent } from "../store/types";
+import type { Play, ScoreAdjustmentEvent } from "../store/types";
 
 const SCORING_POINTS: Record<string, number> = {
   "2PT": 2,
@@ -13,7 +13,8 @@ const SCORING_POINTS: Record<string, number> = {
  */
 export function deriveScoreEvents(
   plays: Play[],
-  opponentScoreEvents: OpponentScoreEvent[],
+  opponentScoreEvents: ScoreAdjustmentEvent[],
+  homeScoreEvents: ScoreAdjustmentEvent[],
 ): ScoreEvent[] {
   const events: ScoreEvent[] = [];
 
@@ -31,6 +32,15 @@ export function deriveScoreEvents(
     const delta = sorted[i].score - sorted[i - 1].score;
     if (delta !== 0) {
       events.push({ time: sorted[i].time, team: "away", delta });
+    }
+  }
+
+  // Home team manual score adjustments (convert cumulative to deltas)
+  const homeSorted = [...homeScoreEvents].sort((a, b) => a.time - b.time);
+  for (let i = 1; i < homeSorted.length; i++) {
+    const delta = homeSorted[i].score - homeSorted[i - 1].score;
+    if (delta !== 0) {
+      events.push({ time: homeSorted[i].time, team: "home", delta });
     }
   }
 

@@ -1,9 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useAppStore } from "../../store/appStore";
 import { useVideoStore } from "../../store/videoStore";
 import { useToastStore } from "../../store/toastStore";
-import { DatabaseService } from "../../services/DatabaseService";
 import { ExportService } from "../../services/ExportService";
+import { logExportEvent } from "../../services/ExportLogService";
 import { StatType } from "../../store/types";
 import { save } from "@tauri-apps/plugin-dialog";
 
@@ -12,14 +12,29 @@ const ALL_STAT_TYPES: StatType[] = [
 ];
 
 export function HighlightExportModal() {
+  const [step, setStep] = useState<"players" | "stats">("players");
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [selectedPlayers, setSelectedPlayers] = useState<Set<number>>(new Set());
   const [exporting, setExporting] = useState(false);
   const setShowHighlightModal = useAppStore((s) => s.setShowHighlightModal);
+  const players = useAppStore((s) => s.players);
+  const plays = useAppStore((s) => s.plays);
   const setIsExporting = useAppStore((s) => s.setIsExporting);
   const setExportProgressVisible = useAppStore((s) => s.setExportProgressVisible);
   const updateExportProgress = useAppStore((s) => s.updateExportProgress);
+  const setExportThumbnailUrl = useAppStore((s) => s.setExportThumbnailUrl);
+  const setExportCurrentProcess = useAppStore((s) => s.setExportCurrentProcess);
+  const setExportCompletionStats = useAppStore((s) => s.setExportCompletionStats);
+  const initializeExportQualityForContext = useAppStore((s) => s.initializeExportQualityForContext);
   const videoPath = useVideoStore((s) => s.videoPath);
   const pushToast = useToastStore((s) => s.pushToast);
+
+  useEffect(() => {
+    initializeExportQualityForContext("highlights");
+  }, [initializeExportQualityForContext]);
+
+  const allSelected = selected.size === ALL_STAT_TYPES.length;
+  const allPlayersSelected = players.length > 0 && selectedPlayers.size === players.length;
 
   const toggle = (type: string) => {
     const next = new Set(selected);
@@ -28,8 +43,35 @@ export function HighlightExportModal() {
     setSelected(next);
   };
 
+  const toggleAll = (checked: boolean) => {
+    if (checked) {
+      setSelected(new Set(ALL_STAT_TYPES));
+      return;
+    }
+    setSelected(new Set());
+  };
+
+  const togglePlayer = (playerId: number) => {
+    const next = new Set(selectedPlayers);
+    if (next.has(playerId)) next.delete(playerId);
+    else next.add(playerId);
+    setSelectedPlayers(next);
+  };
+
+  const toggleAllPlayers = (checked: boolean) => {
+    if (checked) {
+      setSelectedPlayers(new Set(players.map((p) => p.id)));
+      return;
+    }
+    setSelectedPlayers(new Set());
+  };
+
   const handleExport = async () => {
-    if (selected.size === 0 || !videoPath) return;
+    logExportEvent("HighlightExportModal", "handleExport: click");
+    if (selected.size === 0 || !videoPath) {
+      logExportEvent("HighlightExportModal", "handleExport: aborted (no selected stats or videoPath)");
+      return;
+    }
 
     const types = Array.from(selected);
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -41,6 +83,7 @@ export function HighlightExportModal() {
     });
 
     if (!savePath) {
+      logExportEvent("HighlightExportModal", "handleExport: user cancelled save dialog");
       return;
     }
 
@@ -50,35 +93,82 @@ export function HighlightExportModal() {
 
     setExporting(true);
     setIsExporting(true);
+    logExportEvent("HighlightExportModal", `handleExport: export start output=${normalizedPath}`);
+    // Capture thumbnail from video element
+    const videoEl = document.querySelector("video");
+    if (videoEl) {
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = videoEl.videoWidth || 640;
+        canvas.height = videoEl.videoHeight || 360;
+        const ctx = canvas.getContext("2d");
+        ctx?.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+        setExportThumbnailUrl(canvas.toDataURL("image/jpeg", 0.7));
+      } catch { /* ignore cross-origin or empty video */ }
+    }
     setExportProgressVisible(true, "Exporting Highlights");
+    let completed = false;
     try {
-      const allPlays = await Promise.all(
-        types.map((t) => DatabaseService.getPlaysByType(t))
-      );
-      const clips = allPlays
-        .flat()
+      const selectedPlayerIds = new Set(selectedPlayers);
+      const clips = plays
+        .filter((play) => selectedPlayerIds.has(play.player_id) && selected.has(play.event_type as StatType))
         .sort((a, b) => a.start_time - b.start_time)
         .map((p) => ({ start_time: p.start_time, end_time: p.end_time }));
 
       if (clips.length === 0) {
+        logExportEvent("HighlightExportModal", "handleExport: aborted (no clips matched filters)");
         pushToast("No clips found for selected stat types", "info");
         return;
       }
 
-      await ExportService.exportHighlights(videoPath, clips, normalizedPath, {
+      const result = await ExportService.exportHighlights(videoPath, clips, normalizedPath, {
         onProgress: (update) => {
+          logExportEvent(
+            "HighlightExportModal",
+            `handleExport:onProgress percent=${update.percent.toFixed(2)} status=${update.status ?? ""}`,
+          );
           updateExportProgress(update.percent, update.status);
         },
+        onProcessChange: (process) => {
+          logExportEvent("HighlightExportModal", `handleExport:onProcessChange ${process}`);
+          setExportCurrentProcess(process);
+        },
       });
+      setExportCompletionStats({
+        outputPath: result.outputPath,
+        outputSizeBytes: result.outputSizeBytes,
+        totalElapsedMs: result.totalElapsedMs,
+        encodeElapsedMs: result.encodeElapsedMs,
+        encoder: result.encoder,
+        encoderDisplay: result.encoderDisplay,
+        vendorDisplay: result.vendorDisplay,
+        exportWidth: result.exportWidth,
+        exportHeight: result.exportHeight,
+        totalDurationSec: result.totalDurationSec,
+        totalFrames: result.totalFrames,
+        fps: result.fps,
+      });
+      completed = true;
+      logExportEvent("HighlightExportModal", "handleExport: export complete");
       pushToast("Highlight export complete", "success");
       setShowHighlightModal(false);
     } catch (e: any) {
       console.error(e);
-      pushToast(`Export failed: ${e?.message ?? e}`, "error");
+      const message = String(e?.message ?? e ?? "");
+      logExportEvent("HighlightExportModal", `handleExport: export error ${message}`);
+      if (message.toLowerCase().includes("cancelled")) {
+        pushToast("Export cancelled", "info");
+      } else {
+        pushToast(`Export failed: ${message}`, "error");
+      }
     } finally {
+      logExportEvent("HighlightExportModal", "handleExport: cleanup/finalize");
       setExporting(false);
       setIsExporting(false);
-      setExportProgressVisible(false);
+      if (!completed) {
+        setExportCompletionStats(null);
+        setExportProgressVisible(false);
+      }
     }
   };
 
@@ -94,30 +184,97 @@ export function HighlightExportModal() {
             ✕
           </button>
         </div>
-        <p className="text-xs text-gray-400 mb-3">Select stat types to include:</p>
-        <div className="space-y-1.5 mb-4">
-          {ALL_STAT_TYPES.map((type) => (
-            <label
-              key={type}
-              className="flex items-center gap-2 px-3 py-1.5 bg-surface rounded cursor-pointer hover:bg-surface-light transition-colors"
-            >
+        {step === "players" ? (
+          <>
+            <p className="text-xs text-gray-400 mb-3">Select players to include:</p>
+            <label className="flex items-center justify-between px-3 py-1.5 bg-surface rounded border border-panel-border mb-2">
+              <span className="text-sm text-white">Select All Players</span>
               <input
                 type="checkbox"
-                checked={selected.has(type)}
-                onChange={() => toggle(type)}
+                checked={allPlayersSelected}
+                onChange={(e) => toggleAllPlayers(e.target.checked)}
                 className="accent-accent"
               />
-              <span className="text-sm text-white">{type}</span>
             </label>
-          ))}
-        </div>
-        <button
-          onClick={handleExport}
-          disabled={selected.size === 0 || exporting}
-          className="w-full py-2 bg-accent hover:bg-accent-hover text-white rounded text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-        >
-          {exporting ? "Exporting..." : "Export Selected"}
-        </button>
+            <div className="space-y-1.5 mb-4 max-h-56 overflow-y-auto pr-1">
+              {players
+                .slice()
+                .sort((a, b) => a.number - b.number || a.name.localeCompare(b.name))
+                .map((player) => (
+                  <label
+                    key={player.id}
+                    className="flex items-center justify-between gap-2 px-3 py-1.5 bg-surface rounded cursor-pointer hover:bg-surface-light transition-colors"
+                  >
+                    <span className="text-sm text-white">
+                      <span className="text-accent font-semibold mr-2">#{player.number}</span>
+                      {player.name}
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={selectedPlayers.has(player.id)}
+                      onChange={() => togglePlayer(player.id)}
+                      className="accent-accent"
+                    />
+                  </label>
+                ))}
+            </div>
+            <button
+              onClick={() => setStep("stats")}
+              disabled={selectedPlayers.size === 0}
+              className="w-full py-2 bg-accent hover:bg-accent-hover text-white rounded text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              Next: Select Stats
+            </button>
+          </>
+        ) : (
+          <>
+            <p className="text-xs text-gray-400 mb-3">Select stat types to include:</p>
+            <label className="flex items-center justify-between px-3 py-1.5 bg-surface rounded border border-panel-border mb-2">
+              <span className="text-sm text-white">Select All</span>
+              <input
+                type="checkbox"
+                checked={allSelected}
+                onChange={(e) => toggleAll(e.target.checked)}
+                className="accent-accent"
+              />
+            </label>
+            <div className="space-y-1.5 mb-4">
+              {ALL_STAT_TYPES.map((type) => (
+                <label
+                  key={type}
+                  className="flex items-center gap-2 px-3 py-1.5 bg-surface rounded cursor-pointer hover:bg-surface-light transition-colors"
+                >
+                  <input
+                    type="checkbox"
+                    checked={selected.has(type)}
+                    onChange={() => toggle(type)}
+                    className="accent-accent"
+                  />
+                  <span className="text-sm text-white">{type}</span>
+                </label>
+              ))}
+            </div>
+            <label
+              className="flex items-center justify-between text-xs text-gray-400 mb-3"
+            >
+              <button
+                type="button"
+                onClick={() => setStep("players")}
+                className="text-gray-300 hover:text-white transition-colors"
+              >
+                ← Back to Players
+              </button>
+              <span>{selectedPlayers.size} player(s) selected</span>
+            </label>
+            <button
+              onClick={handleExport}
+              disabled={selected.size === 0 || selectedPlayers.size === 0 || exporting}
+              className="w-full py-2 bg-accent hover:bg-accent-hover text-white rounded text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {exporting ? "Exporting..." : "Export Selected"}
+            </button>
+          </>
+        )}
       </div>
     </div>
   );

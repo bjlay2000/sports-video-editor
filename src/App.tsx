@@ -10,6 +10,7 @@ import { ScoringPanel } from "./components/scoring/ScoringPanel";
 import { TimelinePanel } from "./components/timeline/TimelinePanel";
 import { PlayerSelectModal } from "./components/scoring/PlayerSelectModal";
 import { HighlightExportModal } from "./components/scoring/HighlightExportModal";
+import { ExportStatsModal } from "./components/scoring/ExportStatsModal.tsx";
 import { AddPlayerModal } from "./components/scoring/AddPlayerModal";
 import { ToastHost } from "./components/system/ToastHost";
 import { ExportProgressModal } from "./components/export/ExportProgressModal";
@@ -23,6 +24,7 @@ export default function App() {
   const setMarkers = useAppStore((s) => s.setMarkers);
   const showPlayerModal = useAppStore((s) => s.showPlayerModal);
   const showHighlightModal = useAppStore((s) => s.showHighlightModal);
+  const showExportStatsModal = useAppStore((s) => s.showExportStatsModal);
   const showAddPlayerModal = useAppStore((s) => s.showAddPlayerModal);
 
   useEffect(() => {
@@ -76,6 +78,7 @@ export default function App() {
       </PanelGroup>
       {showPlayerModal && <PlayerSelectModal />}
       {showHighlightModal && <HighlightExportModal />}
+      {showExportStatsModal && <ExportStatsModal />}
       {showAddPlayerModal && <AddPlayerModal />}
       <ExportProgressModal />
       <ToastHost />
