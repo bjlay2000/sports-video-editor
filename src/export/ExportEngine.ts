@@ -962,6 +962,7 @@ export async function runExport(config: ExportConfig): Promise<ExportResult> {
   const filtergraphStartedAt = Date.now();
   const qsvEncoderSelected = encoder.name.endsWith("_qsv");
   const useQsvHardwareFilters = qsvEncoderSelected && preparedOverlays.length === 0;
+  const useHwDecodeForPrimaryPath = !qsvEncoderSelected || useQsvHardwareFilters;
   if (qsvEncoderSelected && preparedOverlays.length > 0) {
     exportLog(
       "runExport: QSV encoder selected, but overlays require software overlay filter; using software filtergraph path",
@@ -1166,7 +1167,7 @@ export async function runExport(config: ExportConfig): Promise<ExportResult> {
       buildArgs(
         encoder.codecArgs,
         false,
-        encoder.hwaccelArgs,
+        useHwDecodeForPrimaryPath ? encoder.hwaccelArgs : [],
         useQsvHardwareFilters ? null : (qsvEncoderSelected ? "nv12" : "yuv420p"),
       ),
       {
@@ -1178,9 +1179,12 @@ export async function runExport(config: ExportConfig): Promise<ExportResult> {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const isStall = message.toLowerCase().includes("stalled");
+    const isFilterReinitFailure =
+      message.toLowerCase().includes("error reinitializing filters") ||
+      message.toLowerCase().includes("function not implemented");
     exportLog(`runExport: ffmpeg primary encode failed — ${message} (stall=${isStall})`);
 
-    if (!isStall) {
+    if (!isStall && !isFilterReinitFailure) {
       throw error;
     }
 
@@ -1189,7 +1193,7 @@ export async function runExport(config: ExportConfig): Promise<ExportResult> {
     lastPercentEmitted = -Infinity;
 
     exportLog("runExport: retrying in safe mode (CPU, single-threaded filters)");
-    onProgress?.(10, "Primary encode path stalled, retrying in safe mode...");
+    onProgress?.(10, "Primary encode path failed, retrying in safe mode...");
 
     // Safe mode: no hwaccel, CPU encoder, single-threaded filters
     await runFfmpeg(buildArgs(safeCodecArgs, true, []), {

@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useAppStore } from "../../store/appStore";
 import { DatabaseService } from "../../services/DatabaseService";
 import { PlayCoordinator } from "../../services/PlayCoordinator";
+import { ProjectService } from "../../services/ProjectService";
 
 export function AddPlayerModal() {
   const [name, setName] = useState("");
@@ -15,12 +16,15 @@ export function AddPlayerModal() {
     const num = parseInt(number, 10);
     if (!name.trim() || isNaN(num)) return;
     try {
-      const player = await DatabaseService.addPlayer(name.trim(), num);
-      setPlayers([...players, player]);
+      await ProjectService.ensureProjectDbOpen();
+      await DatabaseService.addPlayer(name.trim(), num);
+      const refreshedPlayers = await DatabaseService.getPlayers();
+      setPlayers(refreshedPlayers);
       setName("");
       setNumber("");
     } catch (e) {
       console.error("Failed to add player:", e);
+      window.alert("Could not add player. Please try again.");
     }
   };
 
@@ -35,13 +39,16 @@ export function AddPlayerModal() {
     );
     if (!confirmed) return;
     try {
+      await ProjectService.ensureProjectDbOpen();
       if (playerPlays.length > 0) {
         await PlayCoordinator.removePlays(playerPlays.map((play) => play.id));
       }
       await DatabaseService.deletePlayer(id);
-      setPlayers(players.filter((p) => p.id !== id));
+      const refreshedPlayers = await DatabaseService.getPlayers();
+      setPlayers(refreshedPlayers);
     } catch (e) {
       console.error("Failed to delete player:", e);
+      window.alert("Could not delete player. Please try again.");
     }
   };
 

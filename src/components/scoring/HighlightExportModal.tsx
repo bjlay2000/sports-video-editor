@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useCallback, useState } from "react";
 import { useAppStore } from "../../store/appStore";
 import { useVideoStore } from "../../store/videoStore";
 import { useToastStore } from "../../store/toastStore";
@@ -28,6 +28,68 @@ export function HighlightExportModal() {
   const initializeExportQualityForContext = useAppStore((s) => s.initializeExportQualityForContext);
   const videoPath = useVideoStore((s) => s.videoPath);
   const pushToast = useToastStore((s) => s.pushToast);
+  const exportThumbCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const exportThumbStateRef = useRef({ lastUpdateAt: 0, lastFrame: 0 });
+  const estimatedSystemLoadRef = useRef(0);
+
+  useEffect(() => {
+    let prevTick = performance.now();
+    const timer = window.setInterval(() => {
+      const now = performance.now();
+      const driftMs = Math.max(0, now - prevTick - 1000);
+      prevTick = now;
+      estimatedSystemLoadRef.current = Math.min(100, (driftMs / 150) * 100);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const tryUpdateExportThumbnail = useCallback(async (status?: string, seekTime?: number) => {
+    const frameMatch = status?.match(/\((\d+)\/(\d+)\)/);
+    const frame = frameMatch ? Number.parseInt(frameMatch[1], 10) : NaN;
+    const now = Date.now();
+    const state = exportThumbStateRef.current;
+    if (estimatedSystemLoadRef.current > 85) return;
+    if (now - state.lastUpdateAt < 1000) return;
+    if (Number.isFinite(frame) && frame > 0 && frame - state.lastFrame < 60) return;
+
+    const videoEl = document.querySelector("video") as HTMLVideoElement | null;
+    if (!videoEl || !videoEl.videoWidth || !videoEl.videoHeight) return;
+
+    // Seek to segment preview position (4s mark or midpoint)
+    if (seekTime !== undefined && Number.isFinite(seekTime) && seekTime >= 0) {
+      videoEl.currentTime = seekTime;
+      await new Promise<void>((resolve) => {
+        const onSeeked = () => { videoEl.removeEventListener("seeked", onSeeked); resolve(); };
+        videoEl.addEventListener("seeked", onSeeked);
+        setTimeout(() => { videoEl.removeEventListener("seeked", onSeeked); resolve(); }, 500);
+      });
+    }
+
+    if (!exportThumbCanvasRef.current) {
+      exportThumbCanvasRef.current = document.createElement("canvas");
+    }
+    const canvas = exportThumbCanvasRef.current;
+    canvas.width = videoEl.videoWidth;
+    canvas.height = videoEl.videoHeight;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    await new Promise<void>((resolve) => {
+      window.requestAnimationFrame(() => {
+        try {
+          ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+          setExportThumbnailUrl(canvas.toDataURL("image/jpeg", 0.65));
+          state.lastUpdateAt = now;
+          if (Number.isFinite(frame) && frame > 0) {
+            state.lastFrame = frame;
+          }
+        } catch {
+          // ignore
+        }
+        resolve();
+      });
+    });
+  }, [setExportThumbnailUrl]);
 
   useEffect(() => {
     initializeExportQualityForContext("highlights");
@@ -92,6 +154,7 @@ export function HighlightExportModal() {
       : `${savePath}.mp4`;
 
     setExporting(true);
+    exportThumbStateRef.current = { lastUpdateAt: 0, lastFrame: 0 };
     setIsExporting(true);
     logExportEvent("HighlightExportModal", `handleExport: export start output=${normalizedPath}`);
     // Capture thumbnail from video element
@@ -121,6 +184,18 @@ export function HighlightExportModal() {
         return;
       }
 
+      // Precompute 4s-mark (or midpoint) seek times for each segment preview
+      const segmentPreviewTimes = clips.map((clip) => {
+        const clipDuration = clip.end_time - clip.start_time;
+        const previewOffset = Math.min(4, clipDuration / 2);
+        return clip.start_time + previewOffset;
+      });
+      const totalHighlightDuration = clips.reduce(
+        (sum, clip) => sum + (clip.end_time - clip.start_time),
+        0,
+      );
+      let lastSegmentIdx = -1;
+
       const result = await ExportService.exportHighlights(videoPath, clips, normalizedPath, {
         onProgress: (update) => {
           logExportEvent(
@@ -128,6 +203,31 @@ export function HighlightExportModal() {
             `handleExport:onProgress percent=${update.percent.toFixed(2)} status=${update.status ?? ""}`,
           );
           updateExportProgress(update.percent, update.status);
+
+          // Determine current segment from progress %
+          // Highlight progress: 5 + (encodedDuration / totalDuration) * 89
+          const encodedPortion = Math.max(0, update.percent - 5) / 89;
+          const encodedDuration = encodedPortion * totalHighlightDuration;
+          let elapsed = 0;
+          let segmentIdx = 0;
+          for (let i = 0; i < clips.length; i++) {
+            elapsed += clips[i].end_time - clips[i].start_time;
+            if (encodedDuration <= elapsed) {
+              segmentIdx = i;
+              break;
+            }
+            segmentIdx = i;
+          }
+
+          // Update thumbnail when entering a new segment (4s preview frame)
+          const seekTime =
+            segmentIdx !== lastSegmentIdx
+              ? segmentPreviewTimes[segmentIdx]
+              : undefined;
+          if (segmentIdx !== lastSegmentIdx) {
+            lastSegmentIdx = segmentIdx;
+          }
+          void tryUpdateExportThumbnail(update.status, seekTime);
         },
         onProcessChange: (process) => {
           logExportEvent("HighlightExportModal", `handleExport:onProcessChange ${process}`);

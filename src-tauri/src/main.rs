@@ -6,8 +6,9 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use tauri::Manager;
 
-pub struct DbState(pub Mutex<Connection>);
+pub struct DbState(pub Mutex<Option<Connection>>);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Player {
@@ -41,15 +42,78 @@ pub struct ClipRange {
     pub end_time: f64,
 }
 
-pub fn get_db_path() -> PathBuf {
-    let mut path = std::env::current_dir().unwrap_or_default();
-    path.push("database.sqlite");
-    path
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TimelineClip {
+    pub id: String,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub sort_order: i32,
 }
 
-pub fn init_db(conn: &Connection) {
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PlayerShift {
+    pub id: i64,
+    pub player_id: i64,
+    pub enter_time: f64,
+    pub exit_time: Option<f64>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub auto_generated_from_play_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ScoreEvent {
+    pub id: i64,
+    pub team: String,
+    pub time: f64,
+    pub score: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct StatRecordResult {
+    pub play: Play,
+    pub game: Game,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PlayerPlayedPercentage {
+    pub player_id: i64,
+    pub played_seconds: f64,
+    pub total_duration: f64,
+    pub percent_played: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Roster {
+    pub roster_id: i64,
+    pub name: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RosterPlayer {
+    pub roster_player_id: i64,
+    pub roster_id: i64,
+    pub name: String,
+    pub number: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RosterPlayerInput {
+    pub name: String,
+    pub number: i32,
+}
+
+pub fn init_db(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS players (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -71,10 +135,61 @@ pub fn init_db(conn: &Connection) {
             home_score INTEGER NOT NULL DEFAULT 0,
             away_score INTEGER NOT NULL DEFAULT 0
         );
+
+        CREATE TABLE IF NOT EXISTS timeline_clips (
+            id TEXT PRIMARY KEY,
+            start_time REAL NOT NULL,
+            end_time REAL NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS player_shifts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER NOT NULL,
+            enter_time REAL NOT NULL,
+            exit_time REAL,
+            source TEXT NOT NULL DEFAULT 'manual_sub',
+            auto_generated_from_play_id TEXT NULL,
+            FOREIGN KEY (player_id) REFERENCES players(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS score_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team TEXT NOT NULL,
+            time REAL NOT NULL,
+            score INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_timeline_sort ON timeline_clips(sort_order);
+        CREATE INDEX IF NOT EXISTS idx_shifts_player ON player_shifts(player_id);
+        CREATE INDEX IF NOT EXISTS idx_shifts_enter ON player_shifts(enter_time);
+        CREATE INDEX IF NOT EXISTS idx_shifts_source_play ON player_shifts(source, auto_generated_from_play_id);
+        CREATE INDEX IF NOT EXISTS idx_plays_timestamp ON plays(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_plays_player ON plays(player_id);
+        CREATE INDEX IF NOT EXISTS idx_plays_event ON plays(event_type);
+        CREATE INDEX IF NOT EXISTS idx_score_events_team ON score_events(team, time);
         ",
     )
-    .expect("Failed to initialize database");
+    .map_err(|e| format!("Failed to initialize database: {}", e))?;
 
+    // Schema versioning
+    let version: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    if version.is_none() {
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '1')",
+            [],
+        )
+        .map_err(|e| format!("Failed to set schema version: {}", e))?;
+    }
+
+    // Ensure default game row
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM games", [], |row| row.get(0))
         .unwrap_or(0);
@@ -83,6 +198,71 @@ pub fn init_db(conn: &Connection) {
         conn.execute("INSERT INTO games (home_score, away_score) VALUES (0, 0)", [])
             .ok();
     }
+
+    // Backward-compatible migration for existing DBs created before source columns.
+    if let Err(err) = conn.execute(
+        "ALTER TABLE player_shifts ADD COLUMN source TEXT NOT NULL DEFAULT 'manual_sub'",
+        [],
+    ) {
+        if !err.to_string().contains("duplicate column name") {
+            return Err(format!("Failed to add player_shifts.source column: {}", err));
+        }
+    }
+
+    if let Err(err) = conn.execute(
+        "ALTER TABLE player_shifts ADD COLUMN auto_generated_from_play_id TEXT NULL",
+        [],
+    ) {
+        if !err.to_string().contains("duplicate column name") {
+            return Err(format!(
+                "Failed to add player_shifts.auto_generated_from_play_id column: {}",
+                err
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn open_rosters_db(app: &tauri::AppHandle) -> Result<Connection, String> {
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let db_dir = app_data.join("sve-data");
+    std::fs::create_dir_all(&db_dir).map_err(|e| e.to_string())?;
+    let db_path = db_dir.join("rosters.db");
+    let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA temp_store = MEMORY;
+         PRAGMA foreign_keys = ON;",
+    )
+    .map_err(|e| e.to_string())?;
+
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS rosters (
+            roster_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS roster_players (
+            roster_player_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            roster_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            number INTEGER NOT NULL,
+            FOREIGN KEY (roster_id) REFERENCES rosters(roster_id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_rosters_updated_at ON rosters(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_roster_players_roster_id ON roster_players(roster_id);
+        CREATE INDEX IF NOT EXISTS idx_roster_players_number ON roster_players(number);
+        ",
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(conn)
 }
 
 fn monitor_log_candidates() -> Vec<PathBuf> {
@@ -218,14 +398,19 @@ mod chrono_like {
 }
 
 mod commands {
-    use super::{resolve_monitor_log_path, ClipRange, DbState, Game, Play, Player};
+    use super::{
+        chrono_like_now, open_rosters_db, resolve_monitor_log_path, ClipRange,
+        DbState, Game, Play, Player, PlayerPlayedPercentage, PlayerShift,
+        Roster, RosterPlayer, RosterPlayerInput, ScoreEvent, StatRecordResult, TimelineClip,
+    };
     use rusqlite::params;
     use std::{
+        collections::{HashMap, HashSet},
         fs,
         io::{BufRead, BufReader, Write},
         process::{Command, Stdio},
     };
-    use tauri::{async_runtime, Emitter, State};
+    use tauri::{async_runtime, Emitter, Manager, State};
 
     #[tauri::command]
     pub fn add_player(
@@ -233,7 +418,8 @@ mod commands {
         name: String,
         number: i32,
     ) -> Result<Player, String> {
-        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
         conn.execute(
             "INSERT INTO players (name, number) VALUES (?1, ?2)",
             params![name, number],
@@ -246,7 +432,8 @@ mod commands {
 
     #[tauri::command]
     pub fn get_players(state: State<DbState>) -> Result<Vec<Player>, String> {
-        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
         let mut stmt = conn
             .prepare("SELECT id, name, number FROM players ORDER BY number")
             .map_err(|e| e.to_string())?;
@@ -293,7 +480,8 @@ mod commands {
 
     #[tauri::command]
     pub fn delete_player(state: State<DbState>, id: i64) -> Result<(), String> {
-        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
         conn.execute("DELETE FROM plays WHERE player_id = ?1", params![id])
             .map_err(|e| e.to_string())?;
         conn.execute("DELETE FROM players WHERE id = ?1", params![id])
@@ -310,7 +498,8 @@ mod commands {
         start_time: f64,
         end_time: f64,
     ) -> Result<Play, String> {
-        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
         conn.execute(
             "INSERT INTO plays (timestamp, player_id, event_type, start_time, end_time) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![timestamp, player_id, event_type, start_time, end_time],
@@ -345,7 +534,8 @@ mod commands {
 
     #[tauri::command]
     pub fn get_plays(state: State<DbState>) -> Result<Vec<Play>, String> {
-        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
         let mut stmt = conn
             .prepare(
                 "SELECT p.id, p.timestamp, p.player_id, p.event_type, p.start_time, p.end_time, pl.name, pl.number
@@ -377,10 +567,91 @@ mod commands {
 
     #[tauri::command]
     pub fn delete_play(state: State<DbState>, id: i64) -> Result<(), String> {
-        let conn = state.0.lock().map_err(|e| e.to_string())?;
-        conn.execute("DELETE FROM plays WHERE id = ?1", params![id])
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+
+        let result = (|| -> Result<(), String> {
+            let play_row: Option<(i64, f64)> = conn
+                .query_row(
+                    "SELECT player_id, timestamp FROM plays WHERE id = ?1",
+                    params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .ok();
+
+            conn.execute("DELETE FROM plays WHERE id = ?1", params![id])
+                .map_err(|e| e.to_string())?;
+
+            let generated_key = id.to_string();
+            let mut shift_stmt = conn
+                .prepare(
+                    "SELECT id, player_id, enter_time, exit_time
+                     FROM player_shifts
+                     WHERE source = 'auto_stat' AND auto_generated_from_play_id = ?1",
+                )
+                .map_err(|e| e.to_string())?;
+
+            let auto_shifts: Vec<(i64, i64, f64, Option<f64>)> = shift_stmt
+                .query_map(params![generated_key], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            for (shift_id, shift_player_id, shift_enter, shift_exit) in auto_shifts {
+                let lower = shift_enter;
+                let upper = shift_exit;
+
+                let other_plays_count: i64 = if let Some(upper_bound) = upper {
+                    conn.query_row(
+                        "SELECT COUNT(*)
+                         FROM plays
+                         WHERE player_id = ?1
+                           AND id <> ?2
+                           AND timestamp >= ?3
+                           AND timestamp < ?4",
+                        params![shift_player_id, id, lower, upper_bound],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| e.to_string())?
+                } else {
+                    conn.query_row(
+                        "SELECT COUNT(*)
+                         FROM plays
+                         WHERE player_id = ?1
+                           AND id <> ?2
+                           AND timestamp >= ?3",
+                        params![shift_player_id, id, lower],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| e.to_string())?
+                };
+
+                if other_plays_count == 0 {
+                    conn.execute("DELETE FROM player_shifts WHERE id = ?1", params![shift_id])
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+
+            // keep compiler happy for unused fetch in older DB edge cases
+            let _ = play_row;
+            Ok(())
+        })();
+
+        if result.is_ok() {
+            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        } else {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+
+        result
     }
 
     #[tauri::command]
@@ -391,7 +662,8 @@ mod commands {
         start_time: f64,
         end_time: f64,
     ) -> Result<Play, String> {
-        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
         conn.execute(
             "UPDATE plays SET timestamp = ?2, start_time = ?3, end_time = ?4 WHERE id = ?1",
             params![id, timestamp, start_time, end_time],
@@ -428,7 +700,8 @@ mod commands {
         state: State<DbState>,
         event_type: String,
     ) -> Result<Vec<Play>, String> {
-        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
         let mut stmt = conn
             .prepare(
                 "SELECT p.id, p.timestamp, p.player_id, p.event_type, p.start_time, p.end_time, pl.name, pl.number
@@ -465,19 +738,22 @@ mod commands {
         home_score: i32,
         away_score: i32,
     ) -> Result<Game, String> {
-        let conn = state.0.lock().map_err(|e| e.to_string())?;
-        conn.execute(
-            "UPDATE games SET home_score = ?1, away_score = ?2 WHERE id = 1",
-            params![home_score, away_score],
-        )
-        .map_err(|e| e.to_string())?;
-        drop(conn);
+        {
+            let guard = state.0.lock().map_err(|e| e.to_string())?;
+            let conn = guard.as_ref().ok_or("No project database is open")?;
+            conn.execute(
+                "UPDATE games SET home_score = ?1, away_score = ?2 WHERE id = 1",
+                params![home_score, away_score],
+            )
+            .map_err(|e| e.to_string())?;
+        }
         get_game(state)
     }
 
     #[tauri::command]
     pub fn get_game(state: State<DbState>) -> Result<Game, String> {
-        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
         conn.query_row(
             "SELECT id, home_score, away_score FROM games WHERE id = 1",
             [],
@@ -490,6 +766,310 @@ mod commands {
             },
         )
         .map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub fn open_project_db(
+        app: tauri::AppHandle,
+        state: State<DbState>,
+        project_id: String,
+    ) -> Result<String, String> {
+        let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+        let db_dir = app_data.join("sve-data");
+        fs::create_dir_all(&db_dir).map_err(|e| e.to_string())?;
+        let db_path = db_dir.join(format!("{}.db", project_id));
+        let conn =
+            rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
+
+        // Performance pragmas + WAL
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA foreign_keys = ON;",
+        )
+        .map_err(|e| e.to_string())?;
+
+        // Verify WAL is active
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        println!("[open_project_db] journal_mode = {}", journal_mode);
+
+        super::init_db(&conn)?;
+
+        let mut guard = state.0.lock().map_err(|e| e.to_string())?;
+        *guard = Some(conn);
+        Ok(db_path.to_string_lossy().to_string())
+    }
+
+    #[tauri::command]
+    pub fn save_timeline_clips(
+        state: State<DbState>,
+        clips: Vec<TimelineClip>,
+    ) -> Result<(), String> {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        let result = (|| -> Result<(), String> {
+            conn.execute("DELETE FROM timeline_clips", [])
+                .map_err(|e| e.to_string())?;
+            let mut stmt = conn
+                .prepare(
+                    "INSERT INTO timeline_clips (id, start_time, end_time, sort_order) VALUES (?1, ?2, ?3, ?4)",
+                )
+                .map_err(|e| e.to_string())?;
+            for (i, clip) in clips.iter().enumerate() {
+                stmt.execute(params![clip.id, clip.start_time, clip.end_time, i as i32])
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })();
+        if result.is_ok() {
+            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        } else {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        result
+    }
+
+    #[tauri::command]
+    pub fn get_timeline_clips(state: State<DbState>) -> Result<Vec<TimelineClip>, String> {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, start_time, end_time, sort_order FROM timeline_clips ORDER BY sort_order",
+            )
+            .map_err(|e| e.to_string())?;
+        let clips = stmt
+            .query_map([], |row| {
+                Ok(TimelineClip {
+                    id: row.get(0)?,
+                    start_time: row.get(1)?,
+                    end_time: row.get(2)?,
+                    sort_order: row.get(3)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(clips)
+    }
+
+    #[tauri::command]
+    pub fn save_player_shifts(
+        state: State<DbState>,
+        shifts: Vec<PlayerShift>,
+    ) -> Result<(), String> {
+        // Step 7: Enforce one open shift per player
+        let mut open_shift_players = HashSet::new();
+        for shift in &shifts {
+            if shift.exit_time.is_none() {
+                if !open_shift_players.insert(shift.player_id) {
+                    return Err(format!(
+                        "Player {} has multiple open shifts",
+                        shift.player_id
+                    ));
+                }
+            }
+        }
+
+        // Step 8: Prevent overlapping shifts per player
+        let mut by_player: HashMap<i64, Vec<&PlayerShift>> = HashMap::new();
+        for shift in &shifts {
+            by_player.entry(shift.player_id).or_default().push(shift);
+        }
+        for (player_id, player_shifts) in &by_player {
+            for i in 0..player_shifts.len() {
+                for j in (i + 1)..player_shifts.len() {
+                    let a = player_shifts[i];
+                    let b = player_shifts[j];
+                    let a_end = a.exit_time.unwrap_or(f64::MAX);
+                    let b_end = b.exit_time.unwrap_or(f64::MAX);
+                    if a.enter_time < b_end && b.enter_time < a_end {
+                        return Err(format!(
+                            "Overlapping shifts detected for player {}",
+                            player_id
+                        ));
+                    }
+                }
+            }
+        }
+
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        let result = (|| -> Result<(), String> {
+            conn.execute("DELETE FROM player_shifts", [])
+                .map_err(|e| e.to_string())?;
+            let mut stmt = conn
+                .prepare(
+                    "INSERT INTO player_shifts (player_id, enter_time, exit_time, source, auto_generated_from_play_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .map_err(|e| e.to_string())?;
+            for shift in &shifts {
+                let source = shift.source.as_deref().unwrap_or("manual_sub");
+                stmt.execute(params![
+                    shift.player_id,
+                    shift.enter_time,
+                    shift.exit_time,
+                    source,
+                    shift.auto_generated_from_play_id
+                ])
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })();
+        if result.is_ok() {
+            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        } else {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        result
+    }
+
+    #[tauri::command]
+    pub fn get_player_shifts(state: State<DbState>) -> Result<Vec<PlayerShift>, String> {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, player_id, enter_time, exit_time, source, auto_generated_from_play_id FROM player_shifts ORDER BY enter_time",
+            )
+            .map_err(|e| e.to_string())?;
+        let shifts = stmt
+            .query_map([], |row| {
+                Ok(PlayerShift {
+                    id: row.get(0)?,
+                    player_id: row.get(1)?,
+                    enter_time: row.get(2)?,
+                    exit_time: row.get(3)?,
+                    source: row.get(4).ok(),
+                    auto_generated_from_play_id: row.get(5).ok(),
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(shifts)
+    }
+
+    #[tauri::command]
+    pub fn save_score_events(
+        state: State<DbState>,
+        events: Vec<ScoreEvent>,
+    ) -> Result<(), String> {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        let result = (|| -> Result<(), String> {
+            conn.execute("DELETE FROM score_events", [])
+                .map_err(|e| e.to_string())?;
+            let mut stmt = conn
+                .prepare(
+                    "INSERT INTO score_events (team, time, score) VALUES (?1, ?2, ?3)",
+                )
+                .map_err(|e| e.to_string())?;
+            for event in &events {
+                stmt.execute(params![event.team, event.time, event.score])
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })();
+        if result.is_ok() {
+            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        } else {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        result
+    }
+
+    #[tauri::command]
+    pub fn get_score_events(state: State<DbState>) -> Result<Vec<ScoreEvent>, String> {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
+        let mut stmt = conn
+            .prepare("SELECT id, team, time, score FROM score_events ORDER BY time")
+            .map_err(|e| e.to_string())?;
+        let events = stmt
+            .query_map([], |row| {
+                Ok(ScoreEvent {
+                    id: row.get(0)?,
+                    team: row.get(1)?,
+                    time: row.get(2)?,
+                    score: row.get(3)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(events)
+    }
+
+    #[tauri::command]
+    pub fn save_players_bulk(
+        state: State<DbState>,
+        players: Vec<Player>,
+    ) -> Result<(), String> {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        let result = (|| -> Result<(), String> {
+            conn.execute("DELETE FROM players", [])
+                .map_err(|e| e.to_string())?;
+            let mut stmt = conn
+                .prepare("INSERT INTO players (id, name, number) VALUES (?1, ?2, ?3)")
+                .map_err(|e| e.to_string())?;
+            for p in &players {
+                stmt.execute(params![p.id, p.name, p.number])
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })();
+        if result.is_ok() {
+            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        } else {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        result
+    }
+
+    #[tauri::command]
+    pub fn save_plays_bulk(
+        state: State<DbState>,
+        plays: Vec<Play>,
+    ) -> Result<(), String> {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        let result = (|| -> Result<(), String> {
+            conn.execute("DELETE FROM plays", [])
+                .map_err(|e| e.to_string())?;
+            let mut stmt = conn
+                .prepare(
+                    "INSERT INTO plays (id, timestamp, player_id, event_type, start_time, end_time) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )
+                .map_err(|e| e.to_string())?;
+            for p in &plays {
+                stmt.execute(params![
+                    p.id,
+                    p.timestamp,
+                    p.player_id,
+                    p.event_type,
+                    p.start_time,
+                    p.end_time
+                ])
+                .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })();
+        if result.is_ok() {
+            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        } else {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        result
     }
 
     #[tauri::command]
@@ -610,20 +1190,504 @@ mod commands {
         result?;
         Ok("ffmpeg completed".into())
     }
+
+    // Step 9: Close open shifts on project load
+    #[tauri::command]
+    pub fn close_open_shifts(
+        state: State<DbState>,
+        project_duration: f64,
+    ) -> Result<(), String> {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
+        conn.execute(
+            "UPDATE player_shifts SET exit_time = ?1 WHERE exit_time IS NULL",
+            params![project_duration],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    // Step 10: Atomic V1 → V2 migration
+    #[tauri::command]
+    pub fn migrate_v1_to_v2(
+        state: State<DbState>,
+        players: Vec<Player>,
+        plays: Vec<Play>,
+        home_score: i32,
+        away_score: i32,
+        timeline_clips: Vec<TimelineClip>,
+        shifts: Vec<PlayerShift>,
+        score_events: Vec<ScoreEvent>,
+    ) -> Result<(), String> {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        let result = (|| -> Result<(), String> {
+            // Players
+            conn.execute("DELETE FROM players", [])
+                .map_err(|e| e.to_string())?;
+            {
+                let mut stmt = conn
+                    .prepare("INSERT INTO players (id, name, number) VALUES (?1, ?2, ?3)")
+                    .map_err(|e| e.to_string())?;
+                for p in &players {
+                    stmt.execute(params![p.id, p.name, p.number])
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+
+            // Plays
+            conn.execute("DELETE FROM plays", [])
+                .map_err(|e| e.to_string())?;
+            {
+                let mut stmt = conn
+                    .prepare(
+                        "INSERT INTO plays (id, timestamp, player_id, event_type, start_time, end_time) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    )
+                    .map_err(|e| e.to_string())?;
+                for p in &plays {
+                    stmt.execute(params![
+                        p.id,
+                        p.timestamp,
+                        p.player_id,
+                        p.event_type,
+                        p.start_time,
+                        p.end_time
+                    ])
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+
+            // Game score
+            conn.execute(
+                "UPDATE games SET home_score = ?1, away_score = ?2 WHERE id = 1",
+                params![home_score, away_score],
+            )
+            .map_err(|e| e.to_string())?;
+
+            // Timeline clips
+            conn.execute("DELETE FROM timeline_clips", [])
+                .map_err(|e| e.to_string())?;
+            {
+                let mut stmt = conn
+                    .prepare(
+                        "INSERT INTO timeline_clips (id, start_time, end_time, sort_order) VALUES (?1, ?2, ?3, ?4)",
+                    )
+                    .map_err(|e| e.to_string())?;
+                for (i, c) in timeline_clips.iter().enumerate() {
+                    stmt.execute(params![c.id, c.start_time, c.end_time, i as i32])
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+
+            // Player shifts
+            conn.execute("DELETE FROM player_shifts", [])
+                .map_err(|e| e.to_string())?;
+            {
+                let mut stmt = conn
+                    .prepare(
+                        "INSERT INTO player_shifts (player_id, enter_time, exit_time) VALUES (?1, ?2, ?3)",
+                    )
+                    .map_err(|e| e.to_string())?;
+                for s in &shifts {
+                    stmt.execute(params![s.player_id, s.enter_time, s.exit_time])
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+
+            // Score events
+            conn.execute("DELETE FROM score_events", [])
+                .map_err(|e| e.to_string())?;
+            {
+                let mut stmt = conn
+                    .prepare(
+                        "INSERT INTO score_events (team, time, score) VALUES (?1, ?2, ?3)",
+                    )
+                    .map_err(|e| e.to_string())?;
+                for ev in &score_events {
+                    stmt.execute(params![ev.team, ev.time, ev.score])
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+
+            Ok(())
+        })();
+        if result.is_ok() {
+            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        } else {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        result
+    }
+
+    // Step 14: Transactional stat recording with side effects
+    #[tauri::command]
+    pub fn record_stat_with_side_effects(
+        state: State<DbState>,
+        timestamp: f64,
+        player_id: i64,
+        event_type: String,
+        start_time: f64,
+        end_time: f64,
+        score_delta: Option<i32>,
+        ensure_on_court: bool,
+        court_enter_time: f64,
+    ) -> Result<StatRecordResult, String> {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        let result = (|| -> Result<StatRecordResult, String> {
+            // Insert play
+            conn.execute(
+                "INSERT INTO plays (timestamp, player_id, event_type, start_time, end_time) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![timestamp, player_id, event_type, start_time, end_time],
+            )
+            .map_err(|e| e.to_string())?;
+            let id = conn.last_insert_rowid();
+
+            // Score update
+            if let Some(delta) = score_delta {
+                conn.execute(
+                    "UPDATE games SET home_score = home_score + ?1 WHERE id = 1",
+                    params![delta],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+
+            // Ensure player on court: add shift if no open shift exists
+            if ensure_on_court {
+                let open_count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM player_shifts WHERE player_id = ?1 AND exit_time IS NULL",
+                        params![player_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+                if open_count == 0 {
+                    conn.execute(
+                        "INSERT INTO player_shifts (player_id, enter_time, exit_time, source, auto_generated_from_play_id) VALUES (?1, ?2, NULL, 'auto_stat', ?3)",
+                        params![player_id, court_enter_time, id.to_string()],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+
+            // Fetch created play with player info
+            let mut stmt = conn
+                .prepare(
+                    "SELECT p.id, p.timestamp, p.player_id, p.event_type, p.start_time, p.end_time, pl.name, pl.number
+                     FROM plays p LEFT JOIN players pl ON pl.id = p.player_id WHERE p.id = ?1",
+                )
+                .map_err(|e| e.to_string())?;
+            let play = stmt
+                .query_row(params![id], |row| {
+                    Ok(Play {
+                        id: row.get(0)?,
+                        timestamp: row.get(1)?,
+                        player_id: row.get(2)?,
+                        event_type: row.get(3)?,
+                        start_time: row.get(4)?,
+                        end_time: row.get(5)?,
+                        player_name: row.get(6).ok(),
+                        player_number: row.get(7).ok(),
+                    })
+                })
+                .map_err(|e| e.to_string())?;
+
+            // Fetch updated game
+            let game = conn
+                .query_row(
+                    "SELECT id, home_score, away_score FROM games WHERE id = 1",
+                    [],
+                    |row| {
+                        Ok(Game {
+                            id: row.get(0)?,
+                            home_score: row.get(1)?,
+                            away_score: row.get(2)?,
+                        })
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+
+            Ok(StatRecordResult { play, game })
+        })();
+        if result.is_ok() {
+            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        } else {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        result
+    }
+
+    // Step 16: EXPLAIN QUERY PLAN debug command
+    #[tauri::command]
+    pub fn explain_query_plans(state: State<DbState>) -> Result<Vec<String>, String> {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
+        let queries = [
+            "SELECT id, start_time, end_time, sort_order FROM timeline_clips ORDER BY sort_order",
+            "SELECT id, player_id, enter_time, exit_time FROM player_shifts ORDER BY enter_time",
+            "SELECT p.id, p.timestamp, p.player_id, p.event_type, p.start_time, p.end_time, pl.name, pl.number FROM plays p LEFT JOIN players pl ON pl.id = p.player_id ORDER BY p.timestamp",
+        ];
+        let mut results = Vec::new();
+        for query in &queries {
+            let explain = format!("EXPLAIN QUERY PLAN {}", query);
+            let mut stmt = conn.prepare(&explain).map_err(|e| e.to_string())?;
+            let rows: Vec<String> = stmt
+                .query_map([], |row| {
+                    let detail: String = row.get(3)?;
+                    Ok(detail)
+                })
+                .map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect();
+            results.push(format!("Query: {}\nPlan: {}", query, rows.join("; ")));
+        }
+        Ok(results)
+    }
+
+    #[tauri::command]
+    pub fn get_played_percentages(
+        state: State<DbState>,
+    ) -> Result<Vec<PlayerPlayedPercentage>, String> {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
+
+        let sql = r#"
+            WITH total AS (
+                SELECT COALESCE(SUM(MAX(0, end_time - start_time)), 0.0) AS total_duration
+                FROM timeline_clips
+            ),
+            per_player AS (
+                SELECT
+                    p.id AS player_id,
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN (
+                                    MIN(COALESCE(s.exit_time, c.end_time), c.end_time)
+                                    - MAX(s.enter_time, c.start_time)
+                                ) > 0
+                                THEN (
+                                    MIN(COALESCE(s.exit_time, c.end_time), c.end_time)
+                                    - MAX(s.enter_time, c.start_time)
+                                )
+                                ELSE 0
+                            END
+                        ),
+                        0.0
+                    ) AS played_seconds
+                FROM players p
+                LEFT JOIN player_shifts s
+                    ON s.player_id = p.id
+                LEFT JOIN timeline_clips c
+                    ON s.player_id IS NOT NULL
+                   AND c.end_time > s.enter_time
+                   AND c.start_time < COALESCE(s.exit_time, c.end_time)
+                GROUP BY p.id
+            )
+            SELECT
+                pp.player_id,
+                pp.played_seconds,
+                t.total_duration,
+                CASE
+                    WHEN t.total_duration > 0
+                    THEN (pp.played_seconds / t.total_duration) * 100.0
+                    ELSE 0.0
+                END AS percent_played
+            FROM per_player pp
+            CROSS JOIN total t
+            ORDER BY pp.player_id
+        "#;
+
+        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PlayerPlayedPercentage {
+                    player_id: row.get(0)?,
+                    played_seconds: row.get(1)?,
+                    total_duration: row.get(2)?,
+                    percent_played: row.get(3)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(rows)
+    }
+
+    #[tauri::command]
+    pub fn create_roster(app: tauri::AppHandle, name: String) -> Result<Roster, String> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err("Roster name is required".into());
+        }
+
+        let conn = open_rosters_db(&app)?;
+        let now = chrono_like_now();
+
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        let result = (|| -> Result<Roster, String> {
+            conn.execute(
+                "INSERT INTO rosters (name, created_at, updated_at) VALUES (?1, ?2, ?3)",
+                params![trimmed, now.clone(), now.clone()],
+            )
+            .map_err(|e| e.to_string())?;
+            let roster_id = conn.last_insert_rowid();
+            Ok(Roster {
+                roster_id,
+                name: trimmed.to_string(),
+                created_at: now.clone(),
+                updated_at: now,
+            })
+        })();
+
+        if result.is_ok() {
+            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        } else {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+
+        result
+    }
+
+    #[tauri::command]
+    pub fn delete_roster(app: tauri::AppHandle, roster_id: i64) -> Result<(), String> {
+        let conn = open_rosters_db(&app)?;
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        let result = (|| -> Result<(), String> {
+            conn.execute(
+                "DELETE FROM roster_players WHERE roster_id = ?1",
+                params![roster_id],
+            )
+            .map_err(|e| e.to_string())?;
+            conn.execute("DELETE FROM rosters WHERE roster_id = ?1", params![roster_id])
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+
+        if result.is_ok() {
+            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        } else {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+
+        result
+    }
+
+    #[tauri::command]
+    pub fn get_rosters(app: tauri::AppHandle) -> Result<Vec<Roster>, String> {
+        let conn = open_rosters_db(&app)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT roster_id, name, created_at, updated_at FROM rosters ORDER BY updated_at DESC, roster_id DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rosters = stmt
+            .query_map([], |row| {
+                Ok(Roster {
+                    roster_id: row.get(0)?,
+                    name: row.get(1)?,
+                    created_at: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rosters)
+    }
+
+    #[tauri::command]
+    pub fn get_roster_players(
+        app: tauri::AppHandle,
+        roster_id: i64,
+    ) -> Result<Vec<RosterPlayer>, String> {
+        let conn = open_rosters_db(&app)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT roster_player_id, roster_id, name, number FROM roster_players WHERE roster_id = ?1 ORDER BY number, roster_player_id",
+            )
+            .map_err(|e| e.to_string())?;
+        let players = stmt
+            .query_map(params![roster_id], |row| {
+                Ok(RosterPlayer {
+                    roster_player_id: row.get(0)?,
+                    roster_id: row.get(1)?,
+                    name: row.get(2)?,
+                    number: row.get(3)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(players)
+    }
+
+    #[tauri::command]
+    pub fn save_roster_players(
+        app: tauri::AppHandle,
+        roster_id: i64,
+        players: Vec<RosterPlayerInput>,
+    ) -> Result<(), String> {
+        let conn = open_rosters_db(&app)?;
+        let now = chrono_like_now();
+
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        let result = (|| -> Result<(), String> {
+            conn.execute(
+                "UPDATE rosters SET updated_at = ?2 WHERE roster_id = ?1",
+                params![roster_id, now],
+            )
+            .map_err(|e| e.to_string())?;
+
+            conn.execute(
+                "DELETE FROM roster_players WHERE roster_id = ?1",
+                params![roster_id],
+            )
+            .map_err(|e| e.to_string())?;
+
+            let mut stmt = conn
+                .prepare(
+                    "INSERT INTO roster_players (roster_id, name, number) VALUES (?1, ?2, ?3)",
+                )
+                .map_err(|e| e.to_string())?;
+            for player in &players {
+                stmt.execute(params![roster_id, player.name, player.number])
+                    .map_err(|e| e.to_string())?;
+            }
+
+            Ok(())
+        })();
+
+        if result.is_ok() {
+            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        } else {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+
+        result
+    }
+
 }
 
 fn main() {
     reset_ffmpeg_monitor_log();
 
-    let db_path = get_db_path();
-    let conn = Connection::open(&db_path).expect("Failed to open database");
-    init_db(&conn);
-
+    // No global DB opened at startup — DB opens only after open_project_db(project_id)
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
-        .manage(DbState(Mutex::new(conn)))
+        .setup(|app| {
+            if let Err(err) = open_rosters_db(&app.handle()) {
+                eprintln!("[startup] failed to open rosters db: {}", err);
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, err).into());
+            }
+            Ok(())
+        })
+        .manage(DbState(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             commands::add_player,
             commands::get_players,
@@ -635,10 +1699,29 @@ fn main() {
             commands::update_play_window,
             commands::update_score,
             commands::get_game,
+            commands::open_project_db,
+            commands::save_timeline_clips,
+            commands::get_timeline_clips,
+            commands::save_player_shifts,
+            commands::get_player_shifts,
+            commands::save_score_events,
+            commands::get_score_events,
+            commands::save_players_bulk,
+            commands::save_plays_bulk,
             commands::ensure_exports_dir,
             commands::append_ffmpeg_monitor_log,
             commands::generate_ffmpeg_concat,
-            commands::run_ffmpeg
+            commands::run_ffmpeg,
+            commands::close_open_shifts,
+            commands::migrate_v1_to_v2,
+            commands::record_stat_with_side_effects,
+            commands::get_played_percentages,
+            commands::explain_query_plans,
+            commands::create_roster,
+            commands::delete_roster,
+            commands::get_rosters,
+            commands::get_roster_players,
+            commands::save_roster_players
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { useAppStore } from "../../store/appStore";
 import { useVideoStore } from "../../store/videoStore";
 import { DatabaseService } from "../../services/DatabaseService";
+import { ProjectService } from "../../services/ProjectService";
+import { useToastStore } from "../../store/toastStore";
 import type { StatType } from "../../store/types";
 
 const SCORING_STATS = ["2PT", "3PT", "FT"];
@@ -36,14 +38,40 @@ export function PlayerSelectModal() {
   const setShowPlayerModal = useAppStore((s) => s.setShowPlayerModal);
   const setPendingStat = useAppStore((s) => s.setPendingStat);
   const onCourtPlayerIds = useAppStore((s) => s.onCourtPlayerIds);
-  const toggleOnCourtPlayer = useAppStore((s) => s.toggleOnCourtPlayer);
+  const setOnCourtStatusAtTime = useAppStore((s) => s.setOnCourtStatusAtTime);
+  const ensurePlayerOnCourtAtTime = useAppStore((s) => s.ensurePlayerOnCourtAtTime);
+  const bumpPlayedPercentRefresh = useAppStore((s) => s.bumpPlayedPercentRefresh);
   const addPlay = useAppStore((s) => s.addPlay);
   const addMarker = useAppStore((s) => s.addMarker);
   const game = useAppStore((s) => s.game);
   const setGame = useAppStore((s) => s.setGame);
   const currentTime = useVideoStore((s) => s.currentTime);
+  const pushToast = useToastStore((s) => s.pushToast);
   const [step, setStep] = useState<SelectionStep>("primary");
   const [followUpContext, setFollowUpContext] = useState<FollowUpContext | null>(null);
+
+  const persistShiftsFromStore = async () => {
+    await ProjectService.ensureProjectDbOpen();
+    const intervals = useAppStore.getState().onCourtIntervals;
+    await DatabaseService.savePlayerShifts(
+      intervals.map((iv) => ({
+        player_id: iv.player_id,
+        enter_time: iv.enter_time,
+        exit_time: iv.exit_time,
+      })),
+    );
+    bumpPlayedPercentRefresh();
+  };
+
+  const handleToggleOnCourt = async (playerId: number, onCourt: boolean, toggleTime: number) => {
+    setOnCourtStatusAtTime(playerId, onCourt, toggleTime);
+    try {
+      await persistShiftsFromStore();
+    } catch (error) {
+      console.error("Failed to save on-court toggle", error);
+      pushToast("Failed to save lineup change", "error");
+    }
+  };
 
   useEffect(() => {
     setStep("primary");
@@ -87,27 +115,37 @@ export function PlayerSelectModal() {
     captureTime: number,
     startTime: number,
     endTime: number,
+    scoreDelta: number | null = null,
   ) => {
-    const play = await DatabaseService.addPlay(
-      captureTime,
+    await ProjectService.ensureProjectDbOpen();
+    // Transactional: play + score + shift in single backend transaction
+    const result = await DatabaseService.recordStatWithSideEffects({
+      timestamp: captureTime,
       playerId,
       eventType,
       startTime,
       endTime,
-    );
-
-    addPlay(play);
-    addMarker({
-      id: play.id,
-      time: play.timestamp,
-      event_type: play.event_type,
-      player_name: play.player_name,
-      start_time: play.start_time,
-      end_time: play.end_time,
-      label: play.event_type,
+      scoreDelta,
+      ensureOnCourt: true,
+      courtEnterTime: captureTime,
     });
 
-    return play;
+    // Update frontend stores from the transactional result
+    ensurePlayerOnCourtAtTime(playerId, captureTime);
+    addPlay(result.play);
+    addMarker({
+      id: result.play.id,
+      time: result.play.timestamp,
+      event_type: result.play.event_type,
+      player_name: result.play.player_name,
+      start_time: result.play.start_time,
+      end_time: result.play.end_time,
+      label: result.play.event_type,
+    });
+    setGame(result.game);
+    bumpPlayedPercentRefresh();
+
+    return result.play;
   };
 
   const closeModal = () => {
@@ -123,14 +161,11 @@ export function PlayerSelectModal() {
     const { captureTime, startTime, endTime } = captureDefaults;
 
     try {
-      await persistPlay(playerId, pendingStat as StatType, captureTime, startTime, endTime);
+      const scoreDelta = SCORING_STATS.includes(pendingStat)
+        ? (pendingStat === "3PT" ? 3 : pendingStat === "2PT" ? 2 : 1)
+        : null;
 
-      if (SCORING_STATS.includes(pendingStat)) {
-        const points = pendingStat === "3PT" ? 3 : pendingStat === "2PT" ? 2 : 1;
-        const newHome = game.home_score + points;
-        const updated = await DatabaseService.updateScore(newHome, game.away_score);
-        setGame(updated);
-      }
+      await persistPlay(playerId, pendingStat as StatType, captureTime, startTime, endTime, scoreDelta);
 
       const needsAssist = ASSIST_PROMPT_STATS.includes(pendingStat as StatType);
       const needsRebound = REBOUND_PROMPT_STATS.includes(pendingStat as StatType);
@@ -271,7 +306,10 @@ export function PlayerSelectModal() {
                   type="checkbox"
                   checked={onCourtSet.has(player.id)}
                   onClick={(event) => event.stopPropagation()}
-                  onChange={(event) => toggleOnCourtPlayer(player.id, event.target.checked)}
+                  onChange={(event) => {
+                    const toggleTime = followUpContext?.captureTime ?? captureDefaults.captureTime;
+                    void handleToggleOnCourt(player.id, event.target.checked, toggleTime);
+                  }}
                   className="accent-accent"
                 />
               </button>
@@ -299,7 +337,10 @@ export function PlayerSelectModal() {
                   type="checkbox"
                   checked={onCourtSet.has(player.id)}
                   onClick={(event) => event.stopPropagation()}
-                  onChange={(event) => toggleOnCourtPlayer(player.id, event.target.checked)}
+                  onChange={(event) => {
+                    const toggleTime = followUpContext?.captureTime ?? captureDefaults.captureTime;
+                    void handleToggleOnCourt(player.id, event.target.checked, toggleTime);
+                  }}
                   className="accent-accent"
                 />
               </button>

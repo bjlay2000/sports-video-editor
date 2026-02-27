@@ -1,11 +1,15 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { save } from "@tauri-apps/plugin-dialog";
+import { writeFile } from "@tauri-apps/plugin-fs";
 import { useAppStore } from "../../store/appStore";
 import { useVideoStore } from "../../store/videoStore";
 import { StatType } from "../../store/types";
 import { PlayCoordinator } from "../../services/PlayCoordinator";
-import { DatabaseService } from "../../services/DatabaseService";
+import { DatabaseService, type PlayerPlayedPercentage } from "../../services/DatabaseService";
 import { useTimelineStore } from "../../store/timelineStore";
 import { videoEngine } from "../../services/VideoEngine";
+import { SubstitutionModal } from "./SubstitutionModal";
+import { ProjectService } from "../../services/ProjectService";
 
 type ShotKey = "2PT" | "3PT" | "FT";
 
@@ -94,24 +98,169 @@ const formatEventLabel = (eventType: string) => {
   return eventType;
 };
 
+function csvEscape(value: string | number | null | undefined): string {
+  const raw = value == null ? "" : String(value);
+  if (/[",\n]/.test(raw)) {
+    return `"${raw.replace(/"/g, '""')}"`;
+  }
+  return raw;
+}
+
 export function ScoringPanel() {
   const game = useAppStore((s) => s.game);
   const plays = useAppStore((s) => s.plays);
   const players = useAppStore((s) => s.players);
+  const setPlayers = useAppStore((s) => s.setPlayers);
+  const resetOnCourtTracking = useAppStore((s) => s.resetOnCourtTracking);
   const setPendingStat = useAppStore((s) => s.setPendingStat);
   const setShowPlayerModal = useAppStore((s) => s.setShowPlayerModal);
   const setShowAddPlayerModal = useAppStore((s) => s.setShowAddPlayerModal);
   const setGame = useAppStore((s) => s.setGame);
+  const onCourtIntervals = useAppStore((s) => s.onCourtIntervals);
+  const playedPercentRefreshVersion = useAppStore((s) => s.playedPercentRefreshVersion);
   const opponentScoreEvents = useAppStore((s) => s.opponentScoreEvents);
   const logOpponentScoreEvent = useAppStore((s) => s.logOpponentScoreEvent);
   const logHomeScoreEvent = useAppStore((s) => s.logHomeScoreEvent);
   const videoSrc = useVideoStore((s) => s.videoSrc);
   const currentTime = useVideoStore((s) => s.currentTime);
+  const duration = useVideoStore((s) => s.duration);
   const setVideoTime = useVideoStore((s) => s.setCurrentTime);
   const showScoreboardOverlay = useVideoStore((s) => s.showScoreboardOverlay);
   const toggleScoreboardOverlay = useVideoStore((s) => s.toggleScoreboardOverlay);
   const setPlayheadTime = useTimelineStore((s) => s.setPlayheadTime);
+  const segments = useTimelineStore((s) => s.segments);
+  const isPlaying = useVideoStore((s) => s.isPlaying);
+  const setIsPlaying = useVideoStore((s) => s.setIsPlaying);
   const [showStatsDrawer, setShowStatsDrawer] = useState(false);
+  const [recentScrollTop, setRecentScrollTop] = useState(0);
+  const [exportingStats, setExportingStats] = useState(false);
+  const [showSubModal, setShowSubModal] = useState(false);
+  const [playedPercentages, setPlayedPercentages] = useState<PlayerPlayedPercentage[]>([]);
+  const [rosters, setRosters] = useState<Array<{ roster_id: number; name: string }>>([]);
+  const [selectedRosterId, setSelectedRosterId] = useState<string>(() => {
+    const stored = localStorage.getItem("sve.selectedRosterId");
+    return stored ?? "";
+  });
+
+  // Fetch DB-derived played % from backend only
+  useEffect(() => {
+    let cancelled = false;
+    DatabaseService.getPlayedPercentages()
+      .then((rows) => {
+        if (!cancelled) {
+          setPlayedPercentages(rows);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setPlayedPercentages([]);
+        }
+        console.error("Failed to load played percentages", error);
+      });
+    return () => { cancelled = true; };
+  }, [players, onCourtIntervals, segments, plays, playedPercentRefreshVersion]);
+
+  useEffect(() => {
+    let cancelled = false;
+    DatabaseService.getRosters()
+      .then((items) => {
+        if (!cancelled) {
+          setRosters(items.map((r) => ({ roster_id: r.roster_id, name: r.name })));
+          const current = localStorage.getItem("sve.selectedRosterId");
+          if (!current) {
+            setSelectedRosterId("");
+          }
+        }
+      })
+      .catch((error) => {
+        console.error("Failed to load rosters", error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleRosterSelection = async (nextValue: string) => {
+    setSelectedRosterId(nextValue);
+    if (!nextValue) {
+      localStorage.removeItem("sve.selectedRosterId");
+      return;
+    }
+
+    localStorage.setItem("sve.selectedRosterId", nextValue);
+
+    const shouldReplace = window.confirm(
+      "Replace current project roster with this saved roster? This updates project players only.",
+    );
+    if (!shouldReplace) {
+      return;
+    }
+
+    if (plays.length > 0) {
+      window.alert("Clear stat tags before replacing roster, then try again.");
+      return;
+    }
+
+    try {
+      await ProjectService.ensureProjectDbOpen();
+      const rosterPlayers = await DatabaseService.getRosterPlayers(Number(nextValue));
+      const projectPlayers = rosterPlayers.map((player, index) => ({
+        id: index + 1,
+        name: player.name,
+        number: player.number,
+      }));
+      await DatabaseService.savePlayersBulk(projectPlayers);
+      const freshPlayers = await DatabaseService.getPlayers();
+      setPlayers(freshPlayers);
+      resetOnCourtTracking();
+    } catch (error) {
+      console.error("Failed to apply roster", error);
+    }
+  };
+
+  const handleDeleteSelectedRoster = async () => {
+    if (!selectedRosterId) return;
+    const rosterId = Number(selectedRosterId);
+    if (!Number.isFinite(rosterId) || rosterId <= 0) return;
+
+    const target = rosters.find((r) => r.roster_id === rosterId);
+    const ok = window.confirm(`Delete saved roster \"${target?.name ?? "this roster"}\"?`);
+    if (!ok) return;
+
+    try {
+      await DatabaseService.deleteRoster(rosterId);
+      const refreshed = await DatabaseService.getRosters();
+      setRosters(refreshed.map((r) => ({ roster_id: r.roster_id, name: r.name })));
+      setSelectedRosterId("");
+      localStorage.removeItem("sve.selectedRosterId");
+    } catch (error) {
+      console.error("Failed to delete roster", error);
+    }
+  };
+
+  const handleSaveAsRoster = async () => {
+    if (players.length === 0) {
+      window.alert("Add players before saving a roster.");
+      return;
+    }
+    const defaultName = `Roster ${new Date().toLocaleDateString()}`;
+    const name = window.prompt("Roster name", defaultName)?.trim();
+    if (!name) return;
+
+    try {
+      const roster = await DatabaseService.createRoster(name);
+      await DatabaseService.saveRosterPlayers(
+        roster.roster_id,
+        players.map((player) => ({ name: player.name, number: player.number })),
+      );
+      const refreshed = await DatabaseService.getRosters();
+      setRosters(refreshed.map((r) => ({ roster_id: r.roster_id, name: r.name })));
+      setSelectedRosterId(String(roster.roster_id));
+      localStorage.setItem("sve.selectedRosterId", String(roster.roster_id));
+    } catch (error) {
+      console.error("Failed to save roster", error);
+    }
+  };
 
   const handleStatClick = (statType: StatType) => {
     if (!videoSrc) return;
@@ -140,8 +289,17 @@ export function ScoringPanel() {
   };
 
   const recentPlays = [...plays]
-    .sort((a, b) => b.timestamp - a.timestamp)
-    .slice(0, 8);
+    .sort((a, b) => b.timestamp - a.timestamp);
+
+  const rowHeight = 38;
+  const listViewportHeight = 300;
+  const overscanRows = 8;
+  const startIndex = Math.max(0, Math.floor(recentScrollTop / rowHeight) - overscanRows);
+  const endIndex = Math.min(
+    recentPlays.length,
+    Math.ceil((recentScrollTop + listViewportHeight) / rowHeight) + overscanRows,
+  );
+  const virtualRows = recentPlays.slice(startIndex, endIndex);
 
   const handleDeletePlay = async (id: number) => {
     await PlayCoordinator.removePlays([id]);
@@ -158,7 +316,25 @@ export function ScoringPanel() {
     [setPlayheadTime, setVideoTime, videoSrc]
   );
 
-  const { statRows, teamTotals } = useMemo(() => {
+  const handleScoreboardPlayPause = useCallback(async () => {
+    if (!videoSrc) return;
+    try {
+      if (isPlaying) {
+        videoEngine.pause();
+        setIsPlaying(false);
+      } else {
+        await videoEngine.play();
+        setIsPlaying(true);
+      }
+    } catch (error) {
+      console.error("Failed to toggle playback from scoreboard", error);
+    }
+  }, [isPlaying, setIsPlaying, videoSrc]);
+
+  const { statRows, teamTotals, totalProjectDuration } = useMemo(() => {
+    const durationFromBackend = playedPercentages[0]?.total_duration ?? 0;
+    const playedMap = new Map(playedPercentages.map((row) => [row.player_id, row]));
+
     const rows = players.map((player) => {
       const shots = createEmptyShotTotals();
       const others = createEmptyOtherTotals();
@@ -185,7 +361,10 @@ export function ScoringPanel() {
         (sum, shot) => sum + shots[shot.key].makes * shot.points,
         0
       );
-      return { player, shots, others, points };
+      const played = playedMap.get(player.id);
+      const playedSec = played?.played_seconds ?? 0;
+      const percentPlayed = played?.percent_played ?? 0;
+      return { player, shots, others, points, playedSec, percentPlayed };
     });
 
     const totals = rows.reduce(
@@ -200,11 +379,76 @@ export function ScoringPanel() {
         acc.points += row.points;
         return acc;
       },
-      { shots: createEmptyShotTotals(), others: createEmptyOtherTotals(), points: 0 }
+      { shots: createEmptyShotTotals(), others: createEmptyOtherTotals(), points: 0, playedSec: 0 }
     );
 
-    return { statRows: rows, teamTotals: totals };
-  }, [players, plays]);
+    const teamPlayedPercent = durationFromBackend > 0
+      ? (totals.playedSec / (durationFromBackend * Math.max(1, players.length))) * 100
+      : 0;
+
+    return {
+      statRows: rows,
+      teamTotals: { ...totals, teamPlayedPercent },
+      totalProjectDuration: durationFromBackend,
+    };
+  }, [players, plays, playedPercentages]);
+
+  const handleExportStatsCsv = useCallback(async () => {
+    if (statRows.length === 0) return;
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const outputPath = await save({
+      defaultPath: `game_stats_${timestamp}.csv`,
+      filters: [{ name: "CSV", extensions: ["csv"] }],
+    });
+    if (!outputPath) return;
+
+    const normalizedPath = outputPath.toLowerCase().endsWith(".csv") ? outputPath : `${outputPath}.csv`;
+
+    const columns = [
+      "Player",
+      "PTS",
+      "% Played",
+      ...SHOT_TYPES.map((shot) => `${shot.label} (M/A)`),
+      ...OTHER_STATS,
+    ];
+
+    const lines: string[] = [];
+    lines.push(columns.map(csvEscape).join(","));
+
+    for (const row of statRows) {
+      lines.push([
+        csvEscape(`#${row.player.number} ${row.player.name}`),
+        csvEscape(row.points),
+        csvEscape(`${row.percentPlayed.toFixed(1)}%`),
+        ...SHOT_TYPES.map((shot) => {
+          const d = row.shots[shot.key];
+          const attempts = d.makes + d.misses;
+          return csvEscape(attempts > 0 ? `${d.makes}/${attempts}` : "-");
+        }),
+        ...OTHER_STATS.map((stat) => csvEscape(row.others[stat] ?? "-")),
+      ].join(","));
+    }
+
+    lines.push([
+      csvEscape("Team Total"),
+      csvEscape(teamTotals.points),
+      csvEscape(`${teamTotals.teamPlayedPercent.toFixed(1)}%`),
+      ...SHOT_TYPES.map((shot) => {
+        const d = teamTotals.shots[shot.key];
+        const attempts = d.makes + d.misses;
+        return csvEscape(attempts > 0 ? `${d.makes}/${attempts}` : "-");
+      }),
+      ...OTHER_STATS.map((stat) => csvEscape(teamTotals.others[stat] ?? "-")),
+    ].join(","));
+
+    try {
+      setExportingStats(true);
+      await writeFile(normalizedPath, new TextEncoder().encode(lines.join("\n")));
+    } finally {
+      setExportingStats(false);
+    }
+  }, [statRows, teamTotals]);
 
   return (
     <div className="h-full flex flex-col bg-panel overflow-hidden">
@@ -241,7 +485,9 @@ export function ScoringPanel() {
               + Player
             </button>
             <button
-              onClick={() => setShowStatsDrawer((prev) => !prev)}
+              onClick={() => {
+                setShowStatsDrawer((prev) => !prev);
+              }}
               className="text-xs px-2 py-1 bg-panel hover:bg-panel-border rounded transition-colors text-gray-200"
             >
               {showStatsDrawer ? "Hide Stats" : "Game Stats"}
@@ -260,7 +506,7 @@ export function ScoringPanel() {
             <div className="text-xs text-gray-400 mt-1">AWAY</div>
           </div>
         </div>
-          <div className="mt-3 flex justify-between gap-4">
+          <div className="mt-3 flex justify-between items-end gap-4">
             <div className="flex flex-col items-start gap-1 text-[11px] text-gray-400 uppercase tracking-wider">
               <span>Home Score</span>
               <div className="flex overflow-hidden rounded border border-panel-border">
@@ -279,6 +525,26 @@ export function ScoringPanel() {
                   +1
                 </button>
               </div>
+            </div>
+            <div className="flex flex-col items-center gap-1 pb-0.5">
+              <button
+                type="button"
+                onClick={handleScoreboardPlayPause}
+                disabled={!videoSrc}
+                className="text-white hover:text-accent text-3xl leading-none transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                title="Play/Pause"
+              >
+                {isPlaying ? "⏸" : "▶"}
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowSubModal(true)}
+                disabled={players.length === 0}
+                className="text-[10px] px-2 py-0.5 bg-panel hover:bg-panel-border rounded border border-panel-border text-gray-300 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                title="Substitutions"
+              >
+                Sub
+              </button>
             </div>
             <div className="flex flex-col items-end gap-1 text-[11px] text-gray-400 uppercase tracking-wider">
               <span>Opponent Score</span>
@@ -301,16 +567,22 @@ export function ScoringPanel() {
             </div>
           </div>
 
-          <div
-            className={`mt-4 rounded-lg border border-panel-border bg-surface p-3 shadow-inner shadow-black/30 transform transition-all duration-300 ease-out ${
-              showStatsDrawer
-                ? "translate-x-0 opacity-100 max-h-[55vh]"
-                : "translate-x-6 opacity-0 max-h-0 overflow-hidden pointer-events-none border-transparent p-0"
-            }`}
-          >
-              <h4 className="text-xs font-semibold text-gray-300 uppercase tracking-wider mb-2">
-                Player Stats
-              </h4>
+          {showStatsDrawer && (
+          <div className="mt-2 rounded-lg border border-panel-border bg-surface p-3 shadow-inner shadow-black/30">
+              <div className="mb-2 flex items-center justify-between">
+                <h4 className="text-xs font-semibold text-gray-300 uppercase tracking-wider">
+                  Player Stats
+                </h4>
+                <button
+                  type="button"
+                  title="Export Stats"
+                  onClick={handleExportStatsCsv}
+                  disabled={exportingStats || statRows.length === 0}
+                  className="rounded px-2 py-1 text-xs text-gray-300 hover:bg-panel-border disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  ⤓
+                </button>
+              </div>
               {statRows.length === 0 ? (
                 <p className="text-xs text-gray-500">No players added yet.</p>
               ) : (
@@ -320,6 +592,7 @@ export function ScoringPanel() {
                       <tr className="text-[10px] uppercase tracking-wider text-gray-500">
                         <th className="text-left font-semibold py-1">Player</th>
                         <th className="text-right font-semibold py-1">PTS</th>
+                        <th className="text-right font-semibold py-1">% Played</th>
                         {SHOT_TYPES.map((shot) => (
                           <th key={shot.key} className="text-right font-semibold py-1 px-1">
                             {shot.label} (M/A)
@@ -333,12 +606,13 @@ export function ScoringPanel() {
                       </tr>
                     </thead>
                     <tbody>
-                      {statRows.map(({ player, shots, others, points }) => (
+                      {statRows.map(({ player, shots, others, points, percentPlayed }) => (
                         <tr key={player.id} className="border-t border-white/5">
                           <td className="py-1 font-medium">
                             #{player.number} {player.name}
                           </td>
                           <td className="py-1 text-right font-mono">{points}</td>
+                          <td className="py-1 text-right font-mono">{percentPlayed.toFixed(1)}%</td>
                           {SHOT_TYPES.map((shot) => {
                             const data = shots[shot.key];
                             const attempts = data.makes + data.misses;
@@ -360,6 +634,7 @@ export function ScoringPanel() {
                       <tr className="border-t border-white/10 text-accent">
                         <td className="py-1 font-semibold">Team Total</td>
                         <td className="py-1 text-right font-mono">{teamTotals.points}</td>
+                        <td className="py-1 text-right font-mono">{teamTotals.teamPlayedPercent.toFixed(1)}%</td>
                         {SHOT_TYPES.map((shot) => {
                           const data = teamTotals.shots[shot.key];
                           const attempts = data.makes + data.misses;
@@ -380,6 +655,7 @@ export function ScoringPanel() {
                 </div>
               )}
           </div>
+          )}
         </div>
       </div>
 
@@ -407,7 +683,7 @@ export function ScoringPanel() {
             </div>
           ))}
         </div>
-        <div className="grid grid-cols-3 gap-1.5 pt-2 border-t border-panel-border mt-3">
+        <div className="grid grid-cols-3 gap-1.5 pt-2 mt-2">
             {SKILL_BUTTONS.map((btn) => (
               <button
                 key={btn.type}
@@ -428,13 +704,25 @@ export function ScoringPanel() {
         {recentPlays.length === 0 ? (
           <p className="text-xs text-gray-500">No plays recorded</p>
         ) : (
-          <div className="space-y-1">
-            {recentPlays.map((play) => (
+          <div
+            className="overflow-y-auto"
+            style={{ height: `${listViewportHeight}px` }}
+            onScroll={(event) => setRecentScrollTop(event.currentTarget.scrollTop)}
+          >
+            <div style={{ height: `${recentPlays.length * rowHeight}px`, position: "relative" }}>
+            {virtualRows.map((play, idx) => (
               <div
                 key={play.id}
                 role="button"
                 tabIndex={0}
                 className="group relative flex items-center gap-2 text-xs bg-surface rounded px-2 py-1.5 cursor-pointer hover:bg-panel-border/60 focus:outline-none focus:ring-1 focus:ring-accent"
+                style={{
+                  position: "absolute",
+                  left: 0,
+                  right: 0,
+                  top: `${(startIndex + idx) * rowHeight}px`,
+                  height: `${rowHeight - 4}px`,
+                }}
                 onClick={() => jumpToPlayStart(play.start_time ?? play.timestamp)}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" || event.key === " ") {
@@ -462,6 +750,7 @@ export function ScoringPanel() {
                 </button>
               </div>
             ))}
+            </div>
           </div>
         )}
       </div>
@@ -470,6 +759,40 @@ export function ScoringPanel() {
         <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-1">
           Roster ({players.length})
         </h3>
+        <div className="flex items-center gap-2 mb-2">
+          <select
+            value={selectedRosterId}
+            onChange={(event) => {
+              void handleRosterSelection(event.target.value);
+            }}
+            className="flex-1 px-2 py-1 bg-surface border border-panel-border rounded text-xs text-gray-200"
+          >
+            <option value="">Select saved roster</option>
+            {rosters.map((roster) => (
+              <option key={roster.roster_id} value={roster.roster_id}>
+                {roster.name}
+              </option>
+            ))}
+          </select>
+          <button
+            onClick={() => {
+              void handleDeleteSelectedRoster();
+            }}
+            disabled={!selectedRosterId}
+            className="px-2 py-1 bg-panel hover:bg-panel-border rounded text-xs text-gray-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Delete selected saved roster"
+          >
+            Delete
+          </button>
+          <button
+            onClick={() => {
+              void handleSaveAsRoster();
+            }}
+            className="px-2 py-1 bg-panel hover:bg-panel-border rounded text-xs text-gray-200 transition-colors"
+          >
+            Save As Roster
+          </button>
+        </div>
         <div className="flex flex-wrap gap-1">
           {players.map((p) => (
             <button
@@ -483,6 +806,10 @@ export function ScoringPanel() {
           ))}
         </div>
       </div>
+
+      {showSubModal && (
+        <SubstitutionModal onClose={() => setShowSubModal(false)} />
+      )}
     </div>
   );
 }

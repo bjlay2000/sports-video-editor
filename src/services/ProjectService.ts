@@ -4,10 +4,13 @@ import { useAppStore } from "../store/appStore";
 import { useTimelineStore } from "../store/timelineStore";
 import { useVideoStore, type MediaClip } from "../store/videoStore";
 import type { Overlay, VideoTrackKeyframe } from "../engine/types";
-import type { ScoreAdjustmentEvent, Play, Player, TimelineMarker } from "../store/types";
+import type { ScoreAdjustmentEvent, Play, Player, TimelineMarker, OnCourtInterval } from "../store/types";
 import type { TimelineSegment } from "../store/timelineStore";
+import { DatabaseService } from "./DatabaseService";
 
-interface ProjectSnapshot {
+/* ── V1 snapshot (legacy, read-only) ── */
+
+interface ProjectSnapshotV1 {
   format: "svp";
   version: 1;
   savedAt: string;
@@ -17,6 +20,7 @@ interface ProjectSnapshot {
     plays: Play[];
     game: { id: number; home_score: number; away_score: number };
     markers: TimelineMarker[];
+    onCourtIntervals: OnCourtInterval[];
     opponentScoreEvents: ScoreAdjustmentEvent[];
     homeScoreEvents: ScoreAdjustmentEvent[];
   };
@@ -42,6 +46,36 @@ interface ProjectSnapshot {
     selectedSegmentId: string | null;
   };
 }
+
+/* ── V2 snapshot (metadata-only; mutable data lives in DB) ── */
+
+interface ProjectSnapshotV2 {
+  format: "svp";
+  version: 2;
+  project_id: string;
+  savedAt: string;
+  video: {
+    videoPath: string | null;
+    clips: Array<Omit<MediaClip, "src">>;
+    activeClipId: string | null;
+    currentTime: number;
+    duration: number;
+    zoomPercent: number;
+    panOffset: { x: number; y: number };
+    keyframeMode: boolean;
+    overlays: Overlay[];
+    videoTrackKeyframes: VideoTrackKeyframe[];
+    showScoreboardOverlay: boolean;
+  };
+  timeline: {
+    pixelsPerSecond: number;
+    scrollX: number;
+    scrollY: number;
+    playheadTime: number;
+  };
+}
+
+type ProjectSnapshot = ProjectSnapshotV1 | ProjectSnapshotV2;
 
 const STAT_EVENT_TYPES = new Set([
   "2PT",
@@ -84,34 +118,156 @@ function withRuntimeClipData(clip: Omit<MediaClip, "src">): MediaClip {
   };
 }
 
+function generateProjectId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `proj-${Math.random().toString(36).slice(2)}-${Date.now()}`;
+}
+
+/* ── Helpers to persist Zustand→DB and DB→Zustand ── */
+
+async function persistMutableDataToDb(): Promise<void> {
+  const app = useAppStore.getState();
+  const timeline = useTimelineStore.getState();
+
+  // timeline clips
+  const dbClips = timeline.segments.map((seg, i) => ({
+    id: seg.id,
+    start_time: seg.start,
+    end_time: seg.end,
+    sort_order: i,
+  }));
+  await DatabaseService.saveTimelineClips(dbClips);
+
+  // player shifts (from onCourtIntervals)
+  await DatabaseService.savePlayerShifts(
+    app.onCourtIntervals.map((iv) => ({
+      player_id: iv.player_id,
+      enter_time: iv.enter_time,
+      exit_time: iv.exit_time,
+    })),
+  );
+
+  // score events (home + away)
+  const allEvents = [
+    ...app.homeScoreEvents.map((e) => ({ team: "home", time: e.time, score: e.score })),
+    ...app.opponentScoreEvents.map((e) => ({ team: "away", time: e.time, score: e.score })),
+  ];
+  await DatabaseService.saveScoreEvents(allEvents);
+
+  // players & plays (bulk replace so DB matches Zustand exactly)
+  await DatabaseService.savePlayersBulk(app.players);
+  await DatabaseService.savePlaysBulk(app.plays);
+
+  // game score
+  await DatabaseService.updateScore(app.game.home_score, app.game.away_score);
+}
+
+async function loadMutableDataFromDb(currentTimelinePosition: number) {
+  // players
+  const players = await DatabaseService.getPlayers();
+
+  // plays (with joined player info)
+  const plays = await DatabaseService.getPlays();
+
+  // game
+  const game = await DatabaseService.getGame();
+
+  // timeline clips → segments
+  const dbClips = await DatabaseService.getTimelineClips();
+  const segments: TimelineSegment[] = dbClips.map((c) => ({
+    id: c.id,
+    start: c.start_time,
+    end: c.end_time,
+  }));
+
+  // player shifts → onCourtIntervals + onCourtPlayerIds
+  const shifts = await DatabaseService.getPlayerShifts();
+  const onCourtIntervals: OnCourtInterval[] = shifts.map((s) => ({
+    player_id: s.player_id,
+    enter_time: s.enter_time,
+    exit_time: s.exit_time,
+  }));
+  const timelinePos = Number.isFinite(currentTimelinePosition)
+    ? Math.max(0, currentTimelinePosition)
+    : 0;
+  const onCourtPlayerIds = Array.from(
+    new Set(
+      shifts
+        .filter((s) => s.enter_time <= timelinePos && (s.exit_time == null || timelinePos < s.exit_time))
+        .map((s) => s.player_id),
+    ),
+  );
+
+  // score events → home/opponent arrays
+  const scoreEvents = await DatabaseService.getScoreEvents();
+  const homeScoreEvents: ScoreAdjustmentEvent[] = scoreEvents
+    .filter((e) => e.team === "home")
+    .map((e) => ({ time: e.time, score: e.score }));
+  const opponentScoreEvents: ScoreAdjustmentEvent[] = scoreEvents
+    .filter((e) => e.team === "away")
+    .map((e) => ({ time: e.time, score: e.score }));
+
+  // markers from plays
+  const statMarkers: TimelineMarker[] = plays.map((play) => ({
+    id: play.id,
+    time: play.timestamp,
+    event_type: play.event_type,
+    player_name: play.player_name,
+    player_number: play.player_number,
+    start_time: play.start_time,
+    end_time: play.end_time,
+    label: play.event_type,
+  }));
+
+  return {
+    players,
+    plays,
+    game,
+    segments,
+    onCourtIntervals,
+    onCourtPlayerIds,
+    homeScoreEvents: homeScoreEvents.length ? homeScoreEvents : [{ time: 0, score: 0 }],
+    opponentScoreEvents: opponentScoreEvents.length ? opponentScoreEvents : [{ time: 0, score: 0 }],
+    markers: statMarkers,
+  };
+}
+
 export class ProjectService {
+  /** Current project ID (set on create / open). */
+  private static _projectId: string | null = null;
+
+  static get projectId(): string | null {
+    return this._projectId;
+  }
+
+  static async ensureProjectDbOpen(): Promise<void> {
+    if (!this._projectId) {
+      this._projectId = generateProjectId();
+    }
+    await DatabaseService.openProjectDb(this._projectId);
+  }
+
   static getProjectSignature(snapshot?: ProjectSnapshot): string {
     const source = snapshot ?? this.buildSnapshot();
-    const normalized: ProjectSnapshot = {
-      ...source,
-      savedAt: "",
-    };
+    const normalized = { ...source, savedAt: "" };
     return JSON.stringify(normalized);
   }
 
-  static buildSnapshot(): ProjectSnapshot {
-    const app = useAppStore.getState();
+  static buildSnapshot(): ProjectSnapshotV2 {
     const video = useVideoStore.getState();
     const timeline = useTimelineStore.getState();
 
+    if (!this._projectId) {
+      this._projectId = generateProjectId();
+    }
+
     return {
       format: "svp",
-      version: 1,
+      version: 2,
+      project_id: this._projectId,
       savedAt: new Date().toISOString(),
-      app: {
-        players: app.players,
-        onCourtPlayerIds: app.onCourtPlayerIds,
-        plays: app.plays,
-        game: app.game,
-        markers: app.markers,
-        opponentScoreEvents: app.opponentScoreEvents,
-        homeScoreEvents: app.homeScoreEvents,
-      },
       video: {
         videoPath: video.videoPath,
         clips: video.clips.map(toClipWithoutRuntime),
@@ -130,75 +286,176 @@ export class ProjectService {
         scrollX: timeline.scrollX,
         scrollY: timeline.scrollY,
         playheadTime: timeline.playheadTime,
-        segments: timeline.segments,
-        selectedSegmentId: timeline.selectedSegmentId,
       },
     };
   }
 
   static async saveProject(path: string): Promise<void> {
+    await this.ensureProjectDbOpen();
+
+    // Persist mutable data to the project DB
+    await persistMutableDataToDb();
+
+    // Write metadata-only JSON
     const payload = JSON.stringify(this.buildSnapshot(), null, 2);
     await writeFile(path, toUtf8(payload));
   }
 
   static async readProject(path: string): Promise<ProjectSnapshot> {
-    const bytes = await readFile(path);
-    const parsed = JSON.parse(fromUtf8(bytes)) as ProjectSnapshot;
-    if (parsed.format !== "svp") {
-      throw new Error("Unsupported project file format");
+    let bytes: Uint8Array;
+    try {
+      bytes = await readFile(path);
+    } catch (e: any) {
+      throw new Error(`Could not read project file: ${e?.message ?? e}`);
     }
-    if (parsed.version !== 1) {
-      throw new Error(`Unsupported project version: ${parsed.version}`);
+
+    let raw: any;
+    try {
+      raw = JSON.parse(fromUtf8(bytes));
+    } catch (e: any) {
+      throw new Error(
+        `Project file is not valid JSON. It may be corrupted or from an incompatible version.`
+      );
     }
-    if (!parsed.app.homeScoreEvents) {
-      parsed.app.homeScoreEvents = [{ time: 0, score: 0 }];
+
+    if (!raw || typeof raw !== "object") {
+      throw new Error("Project file is empty or not a valid project.");
     }
-    if (!Array.isArray(parsed.app.players)) parsed.app.players = [];
-    if (!Array.isArray(parsed.app.onCourtPlayerIds)) parsed.app.onCourtPlayerIds = [];
-    if (!Array.isArray(parsed.app.plays)) parsed.app.plays = [];
-    if (!Array.isArray(parsed.app.markers)) parsed.app.markers = [];
-    if (!Array.isArray(parsed.app.opponentScoreEvents)) {
-      parsed.app.opponentScoreEvents = [{ time: 0, score: 0 }];
+    if (raw.format !== "svp") {
+      throw new Error(
+        `Unsupported project file format${
+          raw.format ? `: "${raw.format}"` : " (missing format field)"
+        }. This file may be from an older or incompatible version.`
+      );
     }
-    if (!Array.isArray(parsed.video.clips)) parsed.video.clips = [];
-    if (!Array.isArray(parsed.timeline.segments)) parsed.timeline.segments = [];
+    if (raw.version !== 1 && raw.version !== 2) {
+      throw new Error(
+        `Unsupported project version: ${raw.version ?? "(none)"}. Only v1 and v2 are supported.`
+      );
+    }
+    const parsed = raw as ProjectSnapshot;
+
+    // V1 defaults
+    if (parsed.version === 1) {
+      const v1 = parsed as ProjectSnapshotV1;
+      if (!v1.app.homeScoreEvents) {
+        v1.app.homeScoreEvents = [{ time: 0, score: 0 }];
+      }
+      if (!Array.isArray(v1.app.players)) v1.app.players = [];
+      if (!Array.isArray(v1.app.onCourtPlayerIds)) v1.app.onCourtPlayerIds = [];
+      if (!Array.isArray(v1.app.plays)) v1.app.plays = [];
+      if (!Array.isArray(v1.app.markers)) v1.app.markers = [];
+      if (!Array.isArray(v1.app.onCourtIntervals)) v1.app.onCourtIntervals = [];
+      if (!Array.isArray(v1.app.opponentScoreEvents)) {
+        v1.app.opponentScoreEvents = [{ time: 0, score: 0 }];
+      }
+      if (!Array.isArray(v1.video.clips)) v1.video.clips = [];
+      if (!Array.isArray(v1.timeline.segments)) v1.timeline.segments = [];
+    }
+
     return parsed;
   }
 
   static async loadProject(path: string): Promise<void> {
     const project = await this.readProject(path);
 
-    const hydratedClips = project.video.clips.map((clip) =>
-      withRuntimeClipData(clip),
-    );
+    if (project.version === 1) {
+      await this.loadV1Project(project as ProjectSnapshotV1, path);
+    } else {
+      await this.loadV2Project(project as ProjectSnapshotV2);
+    }
+  }
 
-    const activeClip = hydratedClips.find((clip) => clip.id === project.video.activeClipId) ?? hydratedClips[0] ?? null;
+  /* ── V1 migration: import data into a new per-project DB ── */
 
-    const statMarkers: TimelineMarker[] = project.app.plays.map((play) => ({
-      id: play.id,
-      time: play.timestamp,
-      event_type: play.event_type,
-      player_name: play.player_name,
-      player_number: play.player_number,
-      start_time: play.start_time,
-      end_time: play.end_time,
-      label: play.event_type,
+  private static async loadV1Project(project: ProjectSnapshotV1, path: string): Promise<void> {
+    // Generate a new project ID and open its DB
+    this._projectId = generateProjectId();
+    await DatabaseService.openProjectDb(this._projectId);
+
+    // Atomic migration: all inserts in a single backend transaction
+    const timelineClips = project.timeline.segments.map((seg, i) => ({
+      id: seg.id,
+      start_time: seg.start,
+      end_time: seg.end,
+      sort_order: i,
     }));
 
-    const nonStatMarkers = project.app.markers.filter(
-      (marker) => !STAT_EVENT_TYPES.has(marker.event_type),
-    );
+    const shifts = project.app.onCourtIntervals.map((iv) => ({
+      id: 0,
+      player_id: iv.player_id,
+      enter_time: iv.enter_time,
+      exit_time: iv.exit_time,
+    }));
 
-    const mergedMarkers: TimelineMarker[] = [...statMarkers, ...nonStatMarkers];
+    const scoreEvents = [
+      ...project.app.homeScoreEvents.map((e) => ({ id: 0, team: "home" as const, time: e.time, score: e.score })),
+      ...project.app.opponentScoreEvents.map((e) => ({ id: 0, team: "away" as const, time: e.time, score: e.score })),
+    ];
+
+    await DatabaseService.migrateV1ToV2({
+      players: project.app.players,
+      plays: project.app.plays,
+      homeScore: project.app.game.home_score,
+      awayScore: project.app.game.away_score,
+      timelineClips,
+      shifts,
+      scoreEvents,
+    });
+
+    // Now load from DB (single source of truth) and apply to stores
+    await this.applyVideoAndTimelineState(project.video, project.timeline);
+
+    // Rewrite project file as v2 to prevent re-migration (Step 11)
+    const v2Snapshot = this.buildSnapshot();
+    const payload = JSON.stringify(v2Snapshot, null, 2);
+    await writeFile(path, toUtf8(payload));
+  }
+
+  /* ── V2 load: open project DB and hydrate from DB ── */
+
+  private static async loadV2Project(project: ProjectSnapshotV2): Promise<void> {
+    this._projectId = project.project_id;
+    await DatabaseService.openProjectDb(this._projectId);
+    await this.applyVideoAndTimelineState(project.video, project.timeline);
+  }
+
+  /* ── Shared: hydrate Zustand stores from DB + metadata ── */
+
+  private static async applyVideoAndTimelineState(
+    video: ProjectSnapshotV2["video"],
+    timeline: ProjectSnapshotV2["timeline"] & { segments?: TimelineSegment[]; selectedSegmentId?: string | null },
+  ): Promise<void> {
+    // Step 9: Close any shifts left open from a crash
+    if (video.duration > 0) {
+      await DatabaseService.closeOpenShifts(video.duration);
+    }
+
+    const timelinePosition = Number.isFinite(timeline.playheadTime)
+      ? Math.max(0, timeline.playheadTime)
+      : Number.isFinite(video.currentTime)
+        ? Math.max(0, video.currentTime)
+        : 0;
+    const dbData = await loadMutableDataFromDb(timelinePosition);
+
+    const hydratedClips = video.clips.map((clip) => withRuntimeClipData(clip));
+    const activeClip =
+      hydratedClips.find((clip) => clip.id === video.activeClipId) ??
+      hydratedClips[0] ??
+      null;
+
+    const statMarkers = dbData.markers;
+    const nonStatMarkers: TimelineMarker[] = [];
 
     useAppStore.setState({
-      players: project.app.players,
-      onCourtPlayerIds: project.app.onCourtPlayerIds,
-      plays: project.app.plays,
-      game: project.app.game,
-      markers: mergedMarkers,
-      opponentScoreEvents: project.app.opponentScoreEvents,
-      homeScoreEvents: project.app.homeScoreEvents,
+      players: dbData.players,
+      onCourtPlayerIds: dbData.onCourtPlayerIds,
+      plays: dbData.plays,
+      game: dbData.game,
+      markers: [...statMarkers, ...nonStatMarkers],
+      onCourtIntervals: dbData.onCourtIntervals,
+      opponentScoreEvents: dbData.opponentScoreEvents,
+      homeScoreEvents: dbData.homeScoreEvents,
       pendingStat: null,
       pendingStatTimestamp: null,
       showPlayerModal: false,
@@ -208,35 +465,40 @@ export class ProjectService {
     });
 
     useVideoStore.setState({
-      videoPath: activeClip?.path ?? project.video.videoPath ?? null,
-      videoSrc: activeClip?.src ?? (project.video.videoPath ? convertFileSrc(project.video.videoPath) : null),
+      videoPath: activeClip?.path ?? video.videoPath ?? null,
+      videoSrc: activeClip?.src ?? (video.videoPath ? convertFileSrc(video.videoPath) : null),
       clips: hydratedClips,
       activeClipId: activeClip?.id ?? null,
-      currentTime: project.video.currentTime,
-      duration: project.video.duration,
-      zoomPercent: project.video.zoomPercent,
-      panOffset: project.video.panOffset,
-      keyframeMode: project.video.keyframeMode,
-      overlays: project.video.overlays,
-      videoTrackKeyframes: project.video.videoTrackKeyframes,
-      showScoreboardOverlay: project.video.showScoreboardOverlay,
+      currentTime: video.currentTime,
+      duration: video.duration,
+      zoomPercent: video.zoomPercent,
+      panOffset: video.panOffset,
+      keyframeMode: video.keyframeMode,
+      overlays: video.overlays,
+      videoTrackKeyframes: video.videoTrackKeyframes,
+      showScoreboardOverlay: video.showScoreboardOverlay,
       selectedOverlayIds: [],
       isPlaying: false,
     });
 
+    // Step 5: Use DB segments strictly — no fallback to metadata or media
+    const segments = dbData.segments;
+    const selectedSegmentId = (timeline as { selectedSegmentId?: string | null }).selectedSegmentId ?? null;
+
     const activeAssets = activeClip?.assets;
 
     useTimelineStore.setState({
-      pixelsPerSecond: project.timeline.pixelsPerSecond,
-      scrollX: project.timeline.scrollX,
-      scrollY: project.timeline.scrollY,
-      playheadTime: project.timeline.playheadTime,
-      segments: project.timeline.segments,
-      selectedSegmentId: project.timeline.selectedSegmentId,
+      pixelsPerSecond: timeline.pixelsPerSecond,
+      scrollX: timeline.scrollX,
+      scrollY: timeline.scrollY,
+      playheadTime: timeline.playheadTime,
+      segments,
+      selectedSegmentId,
       selectedMarkerIds: [],
       thumbnails: activeAssets?.thumbnails ?? [],
       waveformSrc: activeAssets?.waveformSrc ?? null,
       assetsLoading: false,
+      _skipNextSegmentInit: segments.length > 0,
     });
   }
 

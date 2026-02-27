@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { Player, Play, Game, TimelineMarker, ScoreAdjustmentEvent } from "./types";
+import { Player, Play, Game, TimelineMarker, ScoreAdjustmentEvent, OnCourtInterval } from "./types";
 import {
   defaultQualityForContext,
   type ExportQualityContext,
@@ -29,6 +29,7 @@ interface AppState {
   plays: Play[];
   game: Game;
   markers: TimelineMarker[];
+  onCourtIntervals: OnCourtInterval[];
   opponentScoreEvents: ScoreAdjustmentEvent[];
   homeScoreEvents: ScoreAdjustmentEvent[];
   projectSavedSignature: string | null;
@@ -52,9 +53,14 @@ interface AppState {
   exportQualityUserSelected: boolean;
   exportQualityInitializedContexts: Record<ExportQualityContext, boolean>;
   exportEstimatedTime: string | null;
+  playedPercentRefreshVersion: number;
   setPlayers: (players: Player[]) => void;
   setOnCourtPlayerIds: (ids: number[]) => void;
   toggleOnCourtPlayer: (playerId: number, onCourt: boolean) => void;
+  setOnCourtStatusAtTime: (playerId: number, onCourt: boolean, time: number) => void;
+  ensurePlayerOnCourtAtTime: (playerId: number, time: number) => void;
+  setOnCourtIntervals: (intervals: OnCourtInterval[]) => void;
+  resetOnCourtTracking: () => void;
   setPlays: (plays: Play[]) => void;
   addPlay: (play: Play) => void;
   updatePlay: (play: Play) => void;
@@ -85,6 +91,7 @@ interface AppState {
   setExportQualityProfile: (profile: QualityProfile, source?: "user" | "system") => void;
   initializeExportQualityForContext: (context: ExportQualityContext) => void;
   setExportEstimatedTime: (time: string | null) => void;
+  bumpPlayedPercentRefresh: () => void;
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -93,6 +100,7 @@ export const useAppStore = create<AppState>((set) => ({
   plays: [],
   game: { id: 1, home_score: 0, away_score: 0 },
   markers: [],
+  onCourtIntervals: [],
   opponentScoreEvents: [{ time: 0, score: 0 }],
   homeScoreEvents: [{ time: 0, score: 0 }],
   projectSavedSignature: null,
@@ -119,12 +127,14 @@ export const useAppStore = create<AppState>((set) => ({
     full: false,
   },
   exportEstimatedTime: null as string | null,
+  playedPercentRefreshVersion: 0,
   setPlayers: (players) =>
     set((state) => {
       const validIds = new Set(players.map((p) => p.id));
       return {
         players,
         onCourtPlayerIds: state.onCourtPlayerIds.filter((id) => validIds.has(id)),
+        onCourtIntervals: state.onCourtIntervals.filter((interval) => validIds.has(interval.player_id)),
       };
     }),
   setOnCourtPlayerIds: (ids) =>
@@ -138,12 +148,76 @@ export const useAppStore = create<AppState>((set) => ({
     set((state) => {
       const has = state.onCourtPlayerIds.includes(playerId);
       if (onCourt) {
-        return has ? {} : { onCourtPlayerIds: [...state.onCourtPlayerIds, playerId] };
+        if (has) return {};
+        return {
+          onCourtPlayerIds: [...state.onCourtPlayerIds, playerId],
+          onCourtIntervals: [
+            ...state.onCourtIntervals,
+            { player_id: playerId, enter_time: 0, exit_time: null },
+          ],
+        };
       }
-      return has
-        ? { onCourtPlayerIds: state.onCourtPlayerIds.filter((id) => id !== playerId) }
-        : {};
+      if (!has) return {};
+      const updatedIntervals = [...state.onCourtIntervals];
+      for (let i = updatedIntervals.length - 1; i >= 0; i--) {
+        if (updatedIntervals[i].player_id === playerId && updatedIntervals[i].exit_time == null) {
+          updatedIntervals[i] = { ...updatedIntervals[i], exit_time: updatedIntervals[i].enter_time };
+          break;
+        }
+      }
+      return {
+        onCourtPlayerIds: state.onCourtPlayerIds.filter((id) => id !== playerId),
+        onCourtIntervals: updatedIntervals,
+      };
     }),
+  setOnCourtStatusAtTime: (playerId, onCourt, time) =>
+    set((state) => {
+      const normalizedTime = Number.isFinite(time) ? Math.max(0, time) : 0;
+      const has = state.onCourtPlayerIds.includes(playerId);
+      if (onCourt) {
+        if (has) return {};
+        return {
+          onCourtPlayerIds: [...state.onCourtPlayerIds, playerId],
+          onCourtIntervals: [
+            ...state.onCourtIntervals,
+            { player_id: playerId, enter_time: normalizedTime, exit_time: null },
+          ],
+        };
+      }
+
+      if (!has) return {};
+      const updatedIntervals = [...state.onCourtIntervals];
+      for (let i = updatedIntervals.length - 1; i >= 0; i--) {
+        const interval = updatedIntervals[i];
+        if (interval.player_id === playerId && interval.exit_time == null) {
+          updatedIntervals[i] = {
+            ...interval,
+            exit_time: Math.max(interval.enter_time, normalizedTime),
+          };
+          break;
+        }
+      }
+      return {
+        onCourtPlayerIds: state.onCourtPlayerIds.filter((id) => id !== playerId),
+        onCourtIntervals: updatedIntervals,
+      };
+    }),
+  ensurePlayerOnCourtAtTime: (playerId, time) =>
+    set((state) => {
+      if (state.onCourtPlayerIds.includes(playerId)) {
+        return {};
+      }
+      const normalizedTime = Number.isFinite(time) ? Math.max(0, time) : 0;
+      return {
+        onCourtPlayerIds: [...state.onCourtPlayerIds, playerId],
+        onCourtIntervals: [
+          ...state.onCourtIntervals,
+          { player_id: playerId, enter_time: normalizedTime, exit_time: null },
+        ],
+      };
+    }),
+  setOnCourtIntervals: (intervals) => set({ onCourtIntervals: intervals }),
+  resetOnCourtTracking: () => set({ onCourtPlayerIds: [], onCourtIntervals: [] }),
   setPlays: (plays) => set({ plays }),
   addPlay: (play) =>
     set((state) => ({ plays: [...state.plays, play] })),
@@ -278,4 +352,8 @@ export const useAppStore = create<AppState>((set) => ({
       };
     }),
   setExportEstimatedTime: (time) => set({ exportEstimatedTime: time }),
+  bumpPlayedPercentRefresh: () =>
+    set((state) => ({
+      playedPercentRefreshVersion: state.playedPercentRefreshVersion + 1,
+    })),
 }));

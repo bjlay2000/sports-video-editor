@@ -18,11 +18,13 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { MediaLibrary } from "../services/MediaLibrary";
 import { PlayCoordinator } from "../services/PlayCoordinator";
 import { ProjectService } from "../services/ProjectService";
+import { DatabaseService } from "../services/DatabaseService";
 import { logExportEvent } from "../services/ExportLogService";
 
 export function Toolbar() {
   const [confirmAction, setConfirmAction] = useState<null | "clear-tags" | "clear-highlights" | "new-game">(null);
   const [showOverlayPrompt, setShowOverlayPrompt] = useState(false);
+  const [loadErrorMessage, setLoadErrorMessage] = useState<string | null>(null);
   const videoPath = useVideoStore((s) => s.videoPath);
   const duration = useVideoStore((s) => s.duration);
   const showScoreboardOverlay = useVideoStore((s) => s.showScoreboardOverlay);
@@ -30,7 +32,8 @@ export function Toolbar() {
   const plays = useAppStore((s) => s.plays);
   const markers = useAppStore((s) => s.markers);
   const setShowHighlightModal = useAppStore((s) => s.setShowHighlightModal);
-  const setShowExportStatsModal = useAppStore((s) => s.setShowExportStatsModal);
+  const setPlayers = useAppStore((s) => s.setPlayers);
+  const resetOnCourtTracking = useAppStore((s) => s.resetOnCourtTracking);
   const projectSavedSignature = useAppStore((s) => s.projectSavedSignature);
   const setProjectSavedSignature = useAppStore((s) => s.setProjectSavedSignature);
   const setIsExporting = useAppStore((s) => s.setIsExporting);
@@ -53,6 +56,75 @@ export function Toolbar() {
   const [dirtyReason, setDirtyReason] = useState<string>("project change");
   const [currentProjectPath, setCurrentProjectPath] = useState<string | null>(null);
   const [lastAutosavedAt, setLastAutosavedAt] = useState<Date | null>(null);
+  const autosaveTimerRef = useRef<number | null>(null);
+  const autosaveInFlightRef = useRef(false);
+  const exportThumbCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const exportThumbStateRef = useRef({
+    lastUpdateAt: 0,
+    lastFrame: 0,
+  });
+  const estimatedSystemLoadRef = useRef(0);
+
+  useEffect(() => {
+    let prevTick = performance.now();
+    const timer = window.setInterval(() => {
+      const now = performance.now();
+      const driftMs = Math.max(0, now - prevTick - 1000);
+      prevTick = now;
+      // Approximation from event-loop lag; caps at 100.
+      estimatedSystemLoadRef.current = Math.min(100, (driftMs / 150) * 100);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const tryUpdateExportThumbnail = useCallback(async (status?: string, seekTime?: number) => {
+    const frameMatch = status?.match(/\((\d+)\/(\d+)\)/);
+    const frame = frameMatch ? Number.parseInt(frameMatch[1], 10) : NaN;
+    const now = Date.now();
+    const state = exportThumbStateRef.current;
+
+    if (estimatedSystemLoadRef.current > 85) return;
+    if (now - state.lastUpdateAt < 1000) return;
+    if (Number.isFinite(frame) && frame > 0 && frame - state.lastFrame < 60) return;
+
+    const videoEl = document.querySelector("video") as HTMLVideoElement | null;
+    if (!videoEl || !videoEl.videoWidth || !videoEl.videoHeight) return;
+
+    // Seek to approximate encode position for live progress preview
+    if (seekTime !== undefined && Number.isFinite(seekTime) && seekTime >= 0) {
+      videoEl.currentTime = seekTime;
+      await new Promise<void>((resolve) => {
+        const onSeeked = () => { videoEl.removeEventListener("seeked", onSeeked); resolve(); };
+        videoEl.addEventListener("seeked", onSeeked);
+        setTimeout(() => { videoEl.removeEventListener("seeked", onSeeked); resolve(); }, 500);
+      });
+    }
+
+    if (!exportThumbCanvasRef.current) {
+      exportThumbCanvasRef.current = document.createElement("canvas");
+    }
+    const canvas = exportThumbCanvasRef.current;
+    canvas.width = videoEl.videoWidth;
+    canvas.height = videoEl.videoHeight;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    await new Promise<void>((resolve) => {
+      window.requestAnimationFrame(() => {
+        try {
+          ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+          setExportThumbnailUrl(canvas.toDataURL("image/jpeg", 0.65));
+          state.lastUpdateAt = now;
+          if (Number.isFinite(frame) && frame > 0) {
+            state.lastFrame = frame;
+          }
+        } catch {
+          // Ignore draw failures (cross-origin / empty frame)
+        }
+        resolve();
+      });
+    });
+  }, [setExportThumbnailUrl]);
 
   // ── Export time estimation ──
   // Recalculates when quality preset, duration, or video dimensions change.
@@ -166,18 +238,41 @@ export function Toolbar() {
   }, [projectSavedSignature, setProjectSavedSignature]);
 
   useEffect(() => {
-    const timer = window.setInterval(async () => {
-      if (!currentProjectPath || !isProjectDirty) return;
-      try {
-        await ProjectService.saveProject(currentProjectPath);
-        setProjectSavedSignature(ProjectService.getProjectSignature());
-        setLastAutosavedAt(new Date());
-      } catch (error) {
-        console.error("Auto-save failed", error);
-      }
-    }, 60_000);
+    if (autosaveTimerRef.current) {
+      window.clearTimeout(autosaveTimerRef.current);
+      autosaveTimerRef.current = null;
+    }
 
-    return () => window.clearInterval(timer);
+    if (!currentProjectPath || !isProjectDirty) {
+      return;
+    }
+
+    const scheduleAutosave = () => {
+      autosaveTimerRef.current = window.setTimeout(async () => {
+        if (!currentProjectPath || !isProjectDirty) return;
+        if (autosaveInFlightRef.current) return;
+
+        autosaveInFlightRef.current = true;
+        try {
+          await ProjectService.saveProject(currentProjectPath);
+          setProjectSavedSignature(ProjectService.getProjectSignature());
+          setLastAutosavedAt(new Date());
+        } catch (error) {
+          console.error("Auto-save failed", error);
+        } finally {
+          autosaveInFlightRef.current = false;
+        }
+      }, 300_000);
+    };
+
+    scheduleAutosave();
+
+    return () => {
+      if (autosaveTimerRef.current) {
+        window.clearTimeout(autosaveTimerRef.current);
+        autosaveTimerRef.current = null;
+      }
+    };
   }, [currentProjectPath, isProjectDirty, setProjectSavedSignature]);
 
   const handleLoadVideo = async () => {
@@ -194,6 +289,21 @@ export function Toolbar() {
     } catch (err) {
       console.error("Failed to load video", err);
     }
+  };
+
+  const computeSeekTimeFromProgress = (percent: number, exportClips: { start_time: number; end_time: number }[]): number => {
+    const totalDuration = exportClips.reduce((sum, c) => sum + (c.end_time - c.start_time), 0);
+    if (totalDuration <= 0) return 0;
+    const encodedTime = (percent / 100) * totalDuration;
+    let elapsed = 0;
+    for (const clip of exportClips) {
+      const clipDuration = clip.end_time - clip.start_time;
+      if (encodedTime <= elapsed + clipDuration) {
+        return clip.start_time + (encodedTime - elapsed);
+      }
+      elapsed += clipDuration;
+    }
+    return exportClips.length > 0 ? exportClips[exportClips.length - 1].end_time : 0;
   };
 
   const handleExportFull = async () => {
@@ -234,6 +344,7 @@ export function Toolbar() {
       : `${targetPath}.mp4`;
 
     setIsExporting(true);
+    exportThumbStateRef.current = { lastUpdateAt: 0, lastFrame: 0 };
     logExportEvent("Toolbar", `handleExportFull: export start output=${normalizedPath}`);
     // Capture thumbnail from video element
     const videoEl = document.querySelector("video");
@@ -257,6 +368,8 @@ export function Toolbar() {
             `handleExportFull:onProgress percent=${update.percent.toFixed(2)} status=${update.status ?? ""}`,
           );
           updateExportProgress(update.percent, update.status);
+          const seekTime = computeSeekTimeFromProgress(update.percent, clips);
+          void tryUpdateExportThumbnail(update.status, seekTime);
         },
         onProcessChange: (process) => {
           logExportEvent("Toolbar", `handleExportFull:onProcessChange ${process}`);
@@ -312,6 +425,10 @@ export function Toolbar() {
 
     try {
       await ProjectService.saveProject(normalizedPath);
+      if (autosaveTimerRef.current) {
+        window.clearTimeout(autosaveTimerRef.current);
+        autosaveTimerRef.current = null;
+      }
       setCurrentProjectPath(normalizedPath);
       setProjectSavedSignature(ProjectService.getProjectSignature());
       setLastAutosavedAt(new Date());
@@ -340,7 +457,7 @@ export function Toolbar() {
       pushToast("Project loaded", "success");
     } catch (error: any) {
       console.error(error);
-      pushToast(`Load project failed: ${error?.message ?? error}`, "error");
+      setLoadErrorMessage(error?.message ?? String(error));
     }
   };
 
@@ -369,6 +486,29 @@ export function Toolbar() {
     setConfirmAction("new-game");
   };
 
+  const applyOptionalSelectedRoster = async () => {
+    const selectedRosterRaw = localStorage.getItem("sve.selectedRosterId");
+    if (!selectedRosterRaw) return;
+    const selectedRosterId = Number(selectedRosterRaw);
+    if (!Number.isFinite(selectedRosterId) || selectedRosterId <= 0) return;
+
+    const applyRoster = window.confirm(
+      "Apply the currently selected saved roster to this new project?",
+    );
+    if (!applyRoster) return;
+
+    const rosterPlayers = await DatabaseService.getRosterPlayers(selectedRosterId);
+    const projectPlayers = rosterPlayers.map((player, index) => ({
+      id: index + 1,
+      name: player.name,
+      number: player.number,
+    }));
+    await DatabaseService.savePlayersBulk(projectPlayers);
+    const freshPlayers = await DatabaseService.getPlayers();
+    setPlayers(freshPlayers);
+    resetOnCourtTracking();
+  };
+
   const handleConfirmDestructiveAction = async () => {
     const action = confirmAction;
     if (!action) return;
@@ -379,6 +519,7 @@ export function Toolbar() {
         PlayCoordinator.clearAllHighlights();
       } else if (action === "new-game") {
         await PlayCoordinator.resetGame();
+        await applyOptionalSelectedRoster();
       }
     } finally {
       setConfirmAction(null);
@@ -445,14 +586,6 @@ export function Toolbar() {
         className="px-3 py-1.5 bg-panel hover:bg-panel-border rounded text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
       >
         Export Highlights
-      </button>
-
-      <button
-        onClick={() => setShowExportStatsModal(true)}
-        disabled={plays.length === 0}
-        className="px-3 py-1.5 bg-panel hover:bg-panel-border rounded text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-      >
-        Export Stats
       </button>
 
       <label className="flex items-center gap-2 text-xs text-gray-400 ml-1">
@@ -574,6 +707,24 @@ export function Toolbar() {
                 type="button"
                 onClick={handleConfirmDestructiveAction}
                 className="px-3 py-1.5 bg-accent hover:bg-accent-hover rounded text-sm transition-colors"
+              >
+                OK
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {loadErrorMessage && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+          <div className="bg-panel border border-panel-border rounded-lg p-5 w-[28rem]">
+            <h2 className="text-lg font-semibold text-red-400 mb-2">Failed to Load Project</h2>
+            <p className="text-sm text-gray-300 mb-4 whitespace-pre-wrap break-words">{loadErrorMessage}</p>
+            <div className="flex justify-end">
+              <button
+                type="button"
+                onClick={() => setLoadErrorMessage(null)}
+                className="px-4 py-1.5 bg-accent hover:bg-accent-hover rounded text-sm transition-colors"
               >
                 OK
               </button>
