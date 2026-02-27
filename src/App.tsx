@@ -4,6 +4,7 @@ import {
   PanelGroup,
   PanelResizeHandle,
 } from "react-resizable-panels";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { Toolbar } from "./components/Toolbar";
 import { VideoPlayer } from "./components/video/VideoPlayer";
 import { ScoringPanel } from "./components/scoring/ScoringPanel";
@@ -26,6 +27,38 @@ export default function App() {
   const showHighlightModal = useAppStore((s) => s.showHighlightModal);
   const showExportStatsModal = useAppStore((s) => s.showExportStatsModal);
   const showAddPlayerModal = useAppStore((s) => s.showAddPlayerModal);
+
+  // Ctrl+Shift+D → toggle debug inspector window
+  useEffect(() => {
+    const handleKeyDown = async (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.shiftKey && e.key === "D") {
+        e.preventDefault();
+        try {
+          const existing = await WebviewWindow.getByLabel("debug_inspector");
+          if (existing) {
+            await existing.close();
+          } else {
+            new WebviewWindow("debug_inspector", {
+              url: "debug.html",
+              title: "SVE Debug Inspector",
+              width: 420,
+              height: 800,
+              x: 0,
+              y: 100,
+              alwaysOnTop: true,
+              decorations: false,
+              resizable: true,
+              transparent: true,
+            });
+          }
+        } catch (err) {
+          console.error("Failed to toggle debug window:", err);
+        }
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
 
   useEffect(() => {
     const load = async () => {

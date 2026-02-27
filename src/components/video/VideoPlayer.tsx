@@ -82,9 +82,27 @@ export function VideoPlayer() {
     originY: number;
     originWidth: number;
     originHeight: number;
+    originAspect: number;
+    originFontSize: number | null;
     edge: "n" | "s" | "e" | "w" | "ne" | "nw" | "se" | "sw";
   } | null>(null);
   const selectedIdsRef = useRef<string[]>([]);
+
+  const isInteractiveElement = useCallback((target: HTMLElement) => {
+    if (
+      target.closest("button") ||
+      target.closest("input") ||
+      target.closest("select") ||
+      target.closest("option") ||
+      target.closest("textarea") ||
+      target.closest("label") ||
+      target.closest("a")
+    ) {
+      return true;
+    }
+
+    return target.isContentEditable;
+  }, []);
 
   const handleSelectOverlay = useCallback(
     (id: string, additive: boolean) => {
@@ -138,7 +156,7 @@ export function VideoPlayer() {
         target.closest("[data-overlay-node]") ||
         target.closest("[data-video-stage]") ||
         target.closest("[data-timeline-controls]") ||
-        target.closest("button")
+        isInteractiveElement(target)
       ) {
         return;
       }
@@ -149,7 +167,7 @@ export function VideoPlayer() {
 
     window.addEventListener("pointerdown", handleGlobalPointerDown);
     return () => window.removeEventListener("pointerdown", handleGlobalPointerDown);
-  }, [clearOverlaySelection]);
+  }, [clearOverlaySelection, isInteractiveElement]);
 
   const handlePlayPause = useCallback(async () => {
     const element = videoRef.current;
@@ -289,6 +307,31 @@ export function VideoPlayer() {
   );
 
   const renderableOverlays = renderState.overlays;
+  const selectedOverlay = useMemo(() => {
+    if (selectedOverlayIds.length === 0) return null;
+    return renderableOverlays.find((overlay) => overlay.id === selectedOverlayIds[0]) ?? null;
+  }, [renderableOverlays, selectedOverlayIds]);
+  const selectedTextOverlay = useMemo(
+    () => (selectedOverlay && (selectedOverlay.type === "text" || selectedOverlay.type === "scoreboard")
+      ? selectedOverlay
+      : null),
+    [selectedOverlay],
+  );
+  const fontOptions = useMemo(
+    () => [
+      "Inter, sans-serif",
+      "Arial, sans-serif",
+      "Segoe UI, sans-serif",
+      "Tahoma, sans-serif",
+      "Verdana, sans-serif",
+      "Trebuchet MS, sans-serif",
+      "Georgia, serif",
+      "Times New Roman, serif",
+      "Courier New, monospace",
+      "Consolas, monospace",
+    ],
+    [],
+  );
 
   // Sync canvas resolution to video native dimensions
   useEffect(() => {
@@ -386,8 +429,46 @@ export function VideoPlayer() {
         nextHeight = height;
       }
 
+      // Keep aspect ratio only while Shift is held.
+      if (event.shiftKey) {
+        const aspect = resizeSession.originAspect > 0 ? resizeSession.originAspect : (resizeSession.originWidth / Math.max(1, resizeSession.originHeight));
+
+        if (resizeSession.edge === "e" || resizeSession.edge === "w") {
+          nextHeight = Math.max(minSize, nextWidth / aspect);
+          if (resizeSession.edge.includes("n")) {
+            nextY = resizeSession.originY + (resizeSession.originHeight - nextHeight);
+          }
+        } else if (resizeSession.edge === "n" || resizeSession.edge === "s") {
+          nextWidth = Math.max(minSize, nextHeight * aspect);
+          if (resizeSession.edge.includes("w")) {
+            nextX = resizeSession.originX + (resizeSession.originWidth - nextWidth);
+          }
+        } else {
+          // Corner resize: use dominant axis and project the other to keep ratio.
+          const widthFromHeight = nextHeight * aspect;
+          const heightFromWidth = nextWidth / aspect;
+          if (Math.abs(nextWidth - resizeSession.originWidth) >= Math.abs(nextHeight - resizeSession.originHeight)) {
+            nextHeight = Math.max(minSize, heightFromWidth);
+          } else {
+            nextWidth = Math.max(minSize, widthFromHeight);
+          }
+          if (resizeSession.edge.includes("w")) {
+            nextX = resizeSession.originX + (resizeSession.originWidth - nextWidth);
+          }
+          if (resizeSession.edge.includes("n")) {
+            nextY = resizeSession.originY + (resizeSession.originHeight - nextHeight);
+          }
+        }
+      }
+
       setOverlayPosition(resizeSession.id, nextX, nextY);
       setOverlayDimensions(resizeSession.id, nextWidth, nextHeight);
+
+      if (resizeSession.originFontSize && resizeSession.originFontSize > 0) {
+        const scaleRatio = nextWidth / Math.max(1, resizeSession.originWidth);
+        const nextFontSize = Math.max(8, Math.round(resizeSession.originFontSize * scaleRatio));
+        updateOverlay(resizeSession.id, { fontSize: nextFontSize });
+      }
     }
   };
 
@@ -434,6 +515,10 @@ export function VideoPlayer() {
       originY: overlay.y,
       originWidth: overlay.width,
       originHeight: overlay.height,
+      originAspect: overlay.width > 0 && overlay.height > 0 ? overlay.width / overlay.height : 1,
+      originFontSize: overlay.type === "text" || overlay.type === "scoreboard"
+        ? (overlay.fontSize ?? null)
+        : null,
       edge,
     };
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -573,7 +658,7 @@ export function VideoPlayer() {
                       title={handleMessage}
                       {...commonHandlers}
                     >
-                      {isSelected && !isScoreboard && (
+                      {isSelected && (
                         <>
                           {RESIZE_HANDLES.map(({ edge, cursor, style }) => (
                             <button
@@ -623,6 +708,39 @@ export function VideoPlayer() {
           {formatTime(currentTime)}
         </span>
       </div>
+      {selectedTextOverlay && (
+        <div className="border-t border-panel-border bg-surface px-4 py-2 flex items-center gap-3 text-xs">
+          <span className="text-gray-400 uppercase tracking-wider">Text</span>
+          <label className="flex items-center gap-2 text-gray-300">
+            <span>Font</span>
+            <select
+              value={selectedTextOverlay.fontFamily ?? "Inter, sans-serif"}
+              onChange={(event) => updateOverlay(selectedTextOverlay.id, { fontFamily: event.target.value })}
+              className="px-2 py-1 bg-panel border border-panel-border rounded text-xs text-white"
+            >
+              {fontOptions.map((font) => (
+                <option key={font} value={font}>{font.split(",")[0]}</option>
+              ))}
+            </select>
+          </label>
+          <label className="flex items-center gap-2 text-gray-300">
+            <span>Size</span>
+            <input
+              type="number"
+              min={8}
+              max={200}
+              value={Math.max(8, Math.round(selectedTextOverlay.fontSize ?? 24))}
+              onChange={(event) => {
+                const parsed = Number.parseInt(event.target.value, 10);
+                if (!Number.isFinite(parsed)) return;
+                updateOverlay(selectedTextOverlay.id, { fontSize: Math.max(8, Math.min(200, parsed)) });
+              }}
+              className="w-20 px-2 py-1 bg-panel border border-panel-border rounded text-xs text-white"
+            />
+          </label>
+          <span className="text-gray-500">Hold Shift while resizing to keep aspect ratio</span>
+        </div>
+      )}
     </div>
   );
 }

@@ -67,6 +67,9 @@ interface Props {
   onRenameMarker: (marker: TimelineMarker) => void;
   selectedSegmentId: string | null;
   onSegmentSelect: (segmentId: string | null) => void;
+  onPlayheadDragStart: () => void;
+  onPlayheadDragMove: (clientX: number) => void;
+  onPlayheadDragEnd: () => void;
 }
 
 const formatTime = (seconds: number) => {
@@ -137,6 +140,9 @@ export function TimelineRenderer({
   onRenameMarker,
   selectedSegmentId,
   onSegmentSelect,
+  onPlayheadDragStart,
+  onPlayheadDragMove,
+  onPlayheadDragEnd,
 }: Props) {
   const scrubRef = useRef<HTMLDivElement>(null);
   const draggingRef = useRef(false);
@@ -268,6 +274,7 @@ export function TimelineRenderer({
     const handleMouseMove = (event: MouseEvent) => {
       if (draggingRef.current) {
         const time = getTimeFromPointer(event.clientX);
+        onPlayheadDragMove(event.clientX);
         onSeek(time);
       }
       if (resizingRef.current) {
@@ -279,6 +286,7 @@ export function TimelineRenderer({
     const handleMouseUp = () => {
       if (draggingRef.current) {
         draggingRef.current = false;
+        onPlayheadDragEnd();
       }
       if (resizingRef.current) {
         resizingRef.current = null;
@@ -292,7 +300,7 @@ export function TimelineRenderer({
       window.removeEventListener("mousemove", handleMouseMove);
       window.removeEventListener("mouseup", handleMouseUp);
     };
-  }, [getTimeFromPointer, onSeek, onResizeDrag, onResizeEnd, projectToSource]);
+  }, [getTimeFromPointer, onPlayheadDragEnd, onPlayheadDragMove, onSeek, onResizeDrag, onResizeEnd, projectToSource]);
 
   const playheadX = Math.max(0, Math.min(totalWidth, projectPlayhead * pixelsPerSecond));
 
@@ -642,7 +650,9 @@ export function TimelineRenderer({
                 event.stopPropagation();
                 event.preventDefault();
                 draggingRef.current = true;
+                onPlayheadDragStart();
                 const time = getTimeFromPointer(event.clientX);
+                onPlayheadDragMove(event.clientX);
                 onSeek(time);
               }}
               onClick={(event) => event.stopPropagation()}

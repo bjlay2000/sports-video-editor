@@ -134,6 +134,7 @@ export class PlayCoordinator {
     }
     store.resetHomeScoreEvents(0);
     store.resetOpponentScoreEvents(0);
+    store.resetOnCourtTracking();
     const timeline = useTimelineStore.getState();
     timeline.setSelectedMarkerIds([]);
   }

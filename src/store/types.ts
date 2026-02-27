@@ -31,6 +31,12 @@ export interface ScoreAdjustmentEvent {
   score: number;
 }
 
+export interface OnCourtInterval {
+  player_id: number;
+  enter_time: number;
+  exit_time: number | null;
+}
+
 export type StatType =
   | "2PT"
   | "3PT"

@@ -22,7 +22,9 @@ interface TimelineState {
   thumbnailsGenerating: boolean;
   selectedMarkerIds: number[];
   segments: TimelineSegment[];
+  removedSegmentsHistory: Array<{ segment: TimelineSegment; index: number }>;
   selectedSegmentId: string | null;
+  _skipNextSegmentInit: boolean;
   setPixelsPerSecond: (pps: number) => void;
   setScrollX: (x: number) => void;
   setScrollY: (y: number) => void;
@@ -42,7 +44,9 @@ interface TimelineState {
   initializeSegments: (duration: number) => void;
   splitSegment: (time: number) => void;
   removeSegment: (segmentId: string) => void;
+  undoRemoveSegment: () => void;
   setSelectedSegmentId: (segmentId: string | null) => void;
+  setSkipNextSegmentInit: (skip: boolean) => void;
 }
 
 const createSegmentId = () =>
@@ -67,7 +71,9 @@ export const useTimelineStore = create<TimelineState>((set) => ({
   thumbnailsGenerating: false,
   selectedMarkerIds: [],
   segments: [],
+  removedSegmentsHistory: [],
   selectedSegmentId: null,
+  _skipNextSegmentInit: false,
   setPixelsPerSecond: (pps) => set({ pixelsPerSecond: Math.max(2, Math.min(200, pps)) }),
   setScrollX: (x) => set({ scrollX: Math.max(0, x) }),
   setScrollY: (y) => set({ scrollY: y }),
@@ -101,12 +107,13 @@ export const useTimelineStore = create<TimelineState>((set) => ({
       };
     }),
   setSelectedSegmentId: (segmentId) => set({ selectedSegmentId: segmentId }),
+  setSkipNextSegmentInit: (skip) => set({ _skipNextSegmentInit: skip }),
   initializeSegments: (duration) =>
     set(() => {
       if (duration <= 0) {
-        return { segments: [], selectedSegmentId: null };
+        return { segments: [], removedSegmentsHistory: [], selectedSegmentId: null };
       }
-      return { segments: [createSegment(0, duration)], selectedSegmentId: null };
+      return { segments: [createSegment(0, duration)], removedSegmentsHistory: [], selectedSegmentId: null };
     }),
   splitSegment: (time) =>
     set((state) => {
@@ -135,12 +142,31 @@ export const useTimelineStore = create<TimelineState>((set) => ({
       if (state.segments.length <= 1) {
         return state;
       }
-      const filtered = state.segments.filter((segment) => segment.id !== segmentId);
-      if (filtered.length === state.segments.length) {
+      const index = state.segments.findIndex((segment) => segment.id === segmentId);
+      if (index < 0) {
         return state;
       }
+      const filtered = state.segments.filter((segment) => segment.id !== segmentId);
       const selectedSegmentId =
         state.selectedSegmentId === segmentId ? null : state.selectedSegmentId;
-      return { segments: filtered, selectedSegmentId };
+      const removed = state.segments[index];
+      return {
+        segments: filtered,
+        selectedSegmentId,
+        removedSegmentsHistory: [...state.removedSegmentsHistory, { segment: removed, index }],
+      };
+    }),
+  undoRemoveSegment: () =>
+    set((state) => {
+      const last = state.removedSegmentsHistory[state.removedSegmentsHistory.length - 1];
+      if (!last) return state;
+      const nextSegments = [...state.segments];
+      const insertAt = Math.max(0, Math.min(last.index, nextSegments.length));
+      nextSegments.splice(insertAt, 0, last.segment);
+      return {
+        segments: nextSegments,
+        selectedSegmentId: last.segment.id,
+        removedSegmentsHistory: state.removedSegmentsHistory.slice(0, -1),
+      };
     }),
 }));

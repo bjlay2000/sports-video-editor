@@ -17,6 +17,8 @@ import { useAppStore } from "../../store/appStore";
 import { videoEngine } from "../../services/VideoEngine";
 import type { TimelineMarker } from "../../store/types";
 import { PlayCoordinator } from "../../services/PlayCoordinator";
+import { DatabaseService } from "../../services/DatabaseService";
+import { ProjectService } from "../../services/ProjectService";
 
 const formatClock = (seconds: number) => {
   if (!Number.isFinite(seconds)) return "00:00.00";
@@ -49,11 +51,67 @@ const formatMarkerLabel = (eventType: string) => {
   }
 };
 
+const getRecentPlayStyle = (eventType: string) => {
+  switch (eventType) {
+    case "2PT":
+    case "3PT":
+    case "FT":
+      return {
+        borderClass: "border-green-400/20",
+        statTextClass: "text-green-300",
+      };
+    case "2PT_MISS":
+    case "3PT_MISS":
+    case "FT_MISS":
+      return {
+        borderClass: "border-gray-300/15",
+        statTextClass: "text-gray-300",
+      };
+    case "AST":
+      return {
+        borderClass: "border-blue-400/20",
+        statTextClass: "text-blue-300",
+      };
+    case "REB":
+      return {
+        borderClass: "border-yellow-400/20",
+        statTextClass: "text-yellow-300",
+      };
+    case "STL":
+      return {
+        borderClass: "border-purple-400/20",
+        statTextClass: "text-purple-300",
+      };
+    case "BLK":
+      return {
+        borderClass: "border-red-400/20",
+        statTextClass: "text-red-300",
+      };
+    case "TO":
+      return {
+        borderClass: "border-orange-400/20",
+        statTextClass: "text-orange-300",
+      };
+    case "FOUL":
+      return {
+        borderClass: "border-rose-400/20",
+        statTextClass: "text-rose-300",
+      };
+    default:
+      return {
+        borderClass: "border-white/10",
+        statTextClass: "text-gray-300",
+      };
+  }
+};
+
 export function TimelinePanel() {
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const playheadDraggingRef = useRef(false);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const [containerWidth, setContainerWidth] = useState(800);
+  const [recentPlaysScrollTop, setRecentPlaysScrollTop] = useState(0);
   const lastVideoPathRef = useRef<string | null>(null);
 
   const pixelsPerSecond = useTimelineStore((s) => s.pixelsPerSecond);
@@ -75,8 +133,11 @@ export function TimelinePanel() {
   const initializeSegments = useTimelineStore((s) => s.initializeSegments);
   const splitSegment = useTimelineStore((s) => s.splitSegment);
   const removeSegment = useTimelineStore((s) => s.removeSegment);
+  const undoRemoveSegment = useTimelineStore((s) => s.undoRemoveSegment);
   const selectedSegmentId = useTimelineStore((s) => s.selectedSegmentId);
   const setSelectedSegmentId = useTimelineStore((s) => s.setSelectedSegmentId);
+  const skipNextSegmentInit = useTimelineStore((s) => s._skipNextSegmentInit);
+  const setSkipNextSegmentInit = useTimelineStore((s) => s.setSkipNextSegmentInit);
   const duration = useVideoStore((s) => s.duration);
   const currentTime = useVideoStore((s) => s.currentTime);
   const setCurrentTime = useVideoStore((s) => s.setCurrentTime);
@@ -101,6 +162,20 @@ export function TimelinePanel() {
   const removeMarker = useAppStore((s) => s.removeMarker);
   const removeMarkersByIds = useAppStore((s) => s.removeMarkersByIds);
   const updateMarker = useAppStore((s) => s.updateMarker);
+  const bumpPlayedPercentRefresh = useAppStore((s) => s.bumpPlayedPercentRefresh);
+
+  const persistSegmentsToDb = useCallback(async () => {
+    await ProjectService.ensureProjectDbOpen();
+    const segs = useTimelineStore.getState().segments;
+    const dbClips = segs.map((seg, i) => ({
+      id: seg.id,
+      start_time: seg.start,
+      end_time: seg.end,
+      sort_order: i,
+    }));
+    await DatabaseService.saveTimelineClips(dbClips);
+    bumpPlayedPercentRefresh();
+  }, [bumpPlayedPercentRefresh]);
 
   useEffect(() => {
     const observer = new ResizeObserver((entries) => {
@@ -126,14 +201,21 @@ export function TimelinePanel() {
       }
       return;
     }
-    if (!segments.length || lastVideoPathRef.current !== videoPath) {
+    // When loading from a project, segments are already DB-hydrated — skip init
+    if (skipNextSegmentInit) {
+      lastVideoPathRef.current = videoPath;
+      setSkipNextSegmentInit(false);
+      return;
+    }
+    // Step 5: Only init segments for genuinely new media (no DB data loaded)
+    if (!segments.length && lastVideoPathRef.current !== videoPath) {
       initializeSegments(duration);
       lastVideoPathRef.current = videoPath;
       setCurrentTime(0);
       setPlayheadTime(0);
       videoEngine.seek(0);
     }
-  }, [duration, videoPath, segments.length, initializeSegments, setCurrentTime, setPlayheadTime]);
+  }, [duration, videoPath, segments.length, initializeSegments, setCurrentTime, setPlayheadTime, skipNextSegmentInit, setSkipNextSegmentInit]);
 
   const handleWheel = useCallback(
     (e: ReactWheelEvent<HTMLDivElement>) => {
@@ -345,10 +427,26 @@ export function TimelinePanel() {
   const recentTimelinePlays = markers
     .filter((marker) => marker.event_type !== "HIGHLIGHT" && marker.event_type !== "MARKER")
     .filter((marker) => isTimeWithinSegments(marker.time))
-    .sort((a, b) => b.time - a.time)
-    .slice(0, 8);
+    .sort((a, b) => b.time - a.time);
+
+  const recentRowHeight = 56;
+  const recentViewportHeight = 210;
+  const recentOverscanRows = 6;
+  const recentStartIndex = Math.max(0, Math.floor(recentPlaysScrollTop / recentRowHeight) - recentOverscanRows);
+  const recentEndIndex = Math.min(
+    recentTimelinePlays.length,
+    Math.ceil((recentPlaysScrollTop + recentViewportHeight) / recentRowHeight) + recentOverscanRows,
+  );
+  const visibleRecentTimelinePlays = recentTimelinePlays.slice(recentStartIndex, recentEndIndex);
 
   const handleDeleteSelected = async () => {
+    if (selectedSegmentId) {
+      if (segments.length <= 1) return;
+      removeSegment(selectedSegmentId);
+      await persistSegmentsToDb();
+      return;
+    }
+
     if (overlaySelection.length > 0) {
       console.log("[delete] about to remove, selectedOverlayIds:", overlaySelection);
       removeOverlays(overlaySelection);
@@ -368,6 +466,11 @@ export function TimelinePanel() {
       removeMarkersByIds(highlightIds);
     }
     clearSelection();
+  };
+
+  const handleUndoSegmentDelete = () => {
+    undoRemoveSegment();
+    void persistSegmentsToDb();
   };
 
   const [resizeState, setResizeState] = useState<{
@@ -419,11 +522,13 @@ export function TimelinePanel() {
   const handleAddCutPoint = () => {
     if (!segments.length) return;
     splitSegment(playheadTime);
+    void persistSegmentsToDb();
   };
 
   const handleDeleteSegment = (segmentId: string) => {
     if (segments.length <= 1) return;
     removeSegment(segmentId);
+    void persistSegmentsToDb();
   };
 
   useEffect(() => {
@@ -462,13 +567,67 @@ export function TimelinePanel() {
     setScrollX(target);
   };
 
-  useEffect(() => {
-    if (!scrollRef.current) return;
-    const target = Math.max(0, projectPlayhead * pixelsPerSecond - containerWidth / 2);
-    if (Math.abs(target - scrollX) < 1) return;
-    scrollRef.current.scrollTo({ left: target, behavior: "smooth" });
-    setScrollX(target);
-  }, [projectPlayhead, pixelsPerSecond, containerWidth, scrollX, setScrollX]);
+  const handlePlayheadDragStart = useCallback(() => {
+    playheadDraggingRef.current = true;
+  }, []);
+
+  const handlePlayheadDragEnd = useCallback(() => {
+    playheadDraggingRef.current = false;
+  }, []);
+
+  const handlePlayheadDragMove = useCallback(
+    (clientX: number) => {
+      if (!playheadDraggingRef.current) return;
+      const container = containerRef.current;
+      const scroller = scrollRef.current;
+      if (!container || !scroller) return;
+
+      const rect = container.getBoundingClientRect();
+      if (rect.width <= 0) return;
+
+      const edgeZoneWidth = rect.width * 0.1;
+      const leftTrigger = rect.left + edgeZoneWidth;
+      const rightTrigger = rect.right - edgeZoneWidth;
+
+      let edgeDelta = 0;
+      let distanceIntoZone = 0;
+      if (clientX < leftTrigger) {
+        edgeDelta = clientX - leftTrigger;
+        distanceIntoZone = leftTrigger - clientX;
+      } else if (clientX > rightTrigger) {
+        edgeDelta = clientX - rightTrigger;
+        distanceIntoZone = clientX - rightTrigger;
+      }
+
+      if (edgeDelta === 0) return;
+
+      const clampedDistanceIntoZone = Math.max(0, Math.min(edgeZoneWidth, distanceIntoZone));
+      const proximityRatio = edgeZoneWidth > 0 ? clampedDistanceIntoZone / edgeZoneWidth : 0;
+
+      // User request:
+      // - base speed slowed by 1/2
+      // - every 2% deeper into the edge zone adds +25% acceleration
+      const BASE_SCROLL_SPEED = 0.175;
+      const accelerationSteps = Math.floor(proximityRatio / 0.02);
+      const accelerationMultiplier = 1 + accelerationSteps * 0.25;
+
+      const current = scroller.scrollLeft;
+      const maxScroll = Math.max(0, scroller.scrollWidth - scroller.clientWidth);
+      const directionalDistance = Math.sign(edgeDelta) * clampedDistanceIntoZone;
+      const next = Math.max(
+        0,
+        Math.min(
+          maxScroll,
+          current + directionalDistance * BASE_SCROLL_SPEED * accelerationMultiplier
+        )
+      );
+      if (Math.abs(next - current) < 0.5) return;
+
+      scroller.scrollLeft = next;
+      setScrollX(next);
+    },
+    [setScrollX]
+  );
 
   const timelineDuration = projectDuration || duration || 0;
   const totalWidth = Math.max(containerWidth, timelineDuration > 0 ? timelineDuration * pixelsPerSecond : containerWidth);
@@ -476,6 +635,23 @@ export function TimelinePanel() {
   return (
     <div
       className="bg-surface-dark border-b border-panel-border flex flex-col shrink-0"
+      tabIndex={0}
+      onKeyDown={(event) => {
+        const target = event.target as HTMLElement | null;
+        if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) {
+          return;
+        }
+
+        if (event.key === "Delete") {
+          event.preventDefault();
+          void handleDeleteSelected();
+        }
+
+        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
+          event.preventDefault();
+          handleUndoSegmentDelete();
+        }
+      }}
     >
       <input
         ref={imageInputRef}
@@ -561,10 +737,17 @@ export function TimelinePanel() {
           </button>
           <button
             onClick={handleDeleteSelected}
-            disabled={selectedMarkerIds.length === 0 && overlaySelection.length === 0}
+            disabled={selectedMarkerIds.length === 0 && overlaySelection.length === 0 && !selectedSegmentId}
             className="px-2 py-1 bg-panel rounded hover:bg-panel-border transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
           >
             🗑 Delete
+          </button>
+          <button
+            onClick={handleUndoSegmentDelete}
+            className="px-2 py-1 bg-panel rounded hover:bg-panel-border transition-colors"
+            title="Undo last segment delete"
+          >
+            ↩ Undo
           </button>
         </div>
         <div className="flex flex-wrap items-center gap-3 ml-auto">
@@ -623,6 +806,9 @@ export function TimelinePanel() {
               onRenameMarker={handleRenameMarker}
               selectedSegmentId={selectedSegmentId}
               onSegmentSelect={setSelectedSegmentId}
+              onPlayheadDragStart={handlePlayheadDragStart}
+              onPlayheadDragMove={handlePlayheadDragMove}
+              onPlayheadDragEnd={handlePlayheadDragEnd}
             />
           </div>
         </div>
@@ -631,27 +817,52 @@ export function TimelinePanel() {
             <span>Recent Plays</span>
             <span className="text-[10px] text-gray-600">{recentTimelinePlays.length}</span>
           </div>
-          <div className="flex-1 overflow-y-auto pr-1 flex flex-col gap-2">
+          <div
+            className="flex-1 overflow-y-auto pr-1"
+            style={{ height: `${recentViewportHeight}px` }}
+            onScroll={(event) => setRecentPlaysScrollTop(event.currentTarget.scrollTop)}
+          >
             {recentTimelinePlays.length === 0 && (
               <span className="text-gray-600 text-xs">Tag a stat to see it here.</span>
             )}
-            {recentTimelinePlays.map((marker) => (
-              <button
-                key={`recent-timeline-${marker.id}`}
-                className="flex items-center justify-between rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-[11px] text-gray-200 transition hover:bg-white/10"
-                onClick={() => {
-                  handleSelectMarker(marker.id, false);
-                  handleMarkerClick(marker);
-                }}
-                onDoubleClick={() => handleMarkerClick(marker)}
-              >
-                <div className="flex flex-col text-left">
-                  <span className="text-[10px] uppercase tracking-wide text-gray-500">{formatMarkerLabel(marker.event_type)}</span>
-                  <strong className="text-white text-xs">{marker.player_name ?? marker.label ?? "Play"}</strong>
-                </div>
-                <span className="font-mono text-[11px] text-gray-400">{formatClock(marker.time)}</span>
-              </button>
-            ))}
+            <div style={{ height: `${recentTimelinePlays.length * recentRowHeight}px`, position: "relative" }}>
+              {visibleRecentTimelinePlays.map((marker, idx) => {
+                const style = getRecentPlayStyle(marker.event_type);
+
+                return (
+                  <button
+                    key={`recent-timeline-${marker.id}`}
+                    className={`group absolute left-0 right-0 flex items-center justify-between rounded-lg border bg-white/5 px-3 py-2 text-[11px] text-gray-200 transition hover:bg-white/10 ${style.borderClass}`}
+                    style={{
+                      top: `${(recentStartIndex + idx) * recentRowHeight}px`,
+                      height: `${recentRowHeight - 6}px`,
+                    }}
+                    onClick={() => {
+                      handleSelectMarker(marker.id, false);
+                      handleMarkerClick(marker);
+                    }}
+                    onDoubleClick={() => handleMarkerClick(marker)}
+                  >
+                    <div className="flex flex-col text-left">
+                      <span className={`text-[10px] uppercase tracking-wide ${style.statTextClass}`}>{formatMarkerLabel(marker.event_type)}</span>
+                      <strong className="text-white text-xs">{marker.player_name ?? marker.label ?? "Play"}</strong>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono text-[11px] text-gray-400">{formatClock(marker.time)}</span>
+                      <span
+                        className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-red-400"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void PlayCoordinator.removePlays([marker.id]);
+                        }}
+                      >
+                        🗑
+                      </span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
           </div>
         </aside>
       </div>

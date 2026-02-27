@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SVE Debug Inspector</title>
+  <link rel="stylesheet" href="debug.css" />
+</head>
+<body>
+  <div id="titlebar" data-tauri-drag-region>
+    <span data-tauri-drag-region>SVE Debug Inspector</span>
+    <button id="closeBtn" title="Close">&#x2715;</button>
+  </div>
+  <div id="app">
+    <div id="topControls" class="header top-controls">
+      <div class="db-path">Live DB Inspector</div>
+      <div class="controls">
+        <div class="transparency-control">
+          <span class="transparency-label">Transparency</span>
+          <input id="transparencySlider" class="transparency-slider" type="range" min="0" max="90" step="1" value="25" oninput="onTransparencyChange(this.value)" onpointerdown="startTransparencyDrag()" onpointerup="endTransparencyDrag()" onpointercancel="endTransparencyDrag()" onchange="endTransparencyDrag()" />
+          <span id="transparencyValue" class="transparency-value">25%</span>
+        </div>
+        <button class="btn" title="Fetch data once now" onclick="fetchAndRender()">&#x21BB; Refresh</button>
+        <button id="autoRefreshBtn" class="btn active" title="Toggle 1s auto-refresh polling" onclick="toggleAutoRefresh()">&#x25CF; Auto 1s</button>
+      </div>
+    </div>
+
+    <div id="content" class="content-scroll">
+      <div class="loading">Starting&hellip;</div>
+    </div>
+
+    <div id="statusBar" class="status-bar">
+      <span id="statusLeft"><span class="pulse"></span>Live &mdash; --:--:--</span>
+      <span id="statusRight">0 clips &middot; 0 shifts &middot; 0 plays &middot; 0 scores</span>
+    </div>
+  </div>
+
+  <script>
+    let invoke = null;
+    let autoRefresh = true;
+    let intervalId = null;
+    let lastState = null;
+    let collapsedSections = {};
+    let transparencyPercent = 25;
+    let isAdjustingTransparency = false;
+    let bootAttempts = 0;
+    const MAX_BOOT_ATTEMPTS = 100;
+
+    // Wait for __TAURI__ to be injected, then start
+    function boot() {
+      initTransparency();
+      if (window.__TAURI_INTERNALS__ && typeof window.__TAURI_INTERNALS__.invoke === 'function') {
+        invoke = window.__TAURI_INTERNALS__.invoke;
+        setupCloseButton();
+        startPolling();
+        fetchAndRender();
+      } else if (window.__TAURI__ && window.__TAURI__.core && typeof window.__TAURI__.core.invoke === 'function') {
+        invoke = window.__TAURI__.core.invoke;
+        setupCloseButton();
+        startPolling();
+        fetchAndRender();
+      } else {
+        bootAttempts += 1;
+        if (bootAttempts >= MAX_BOOT_ATTEMPTS) {
+          const el = document.getElementById('content');
+          if (el) {
+            el.innerHTML = '<div class="warning-container"><h3>Error</h3><div class="warning-item">Tauri bridge not available in debug window. Restart the app after config reload.</div></div>';
+          }
+          return;
+        }
+        setTimeout(boot, 50);
+      }
+    }
+    boot();
+
+    function setupCloseButton() {
+      document.getElementById('closeBtn').addEventListener('click', async () => {
+        try {
+          if (invoke) {
+            await invoke('plugin:window|close', { label: 'debug_inspector' });
+          } else {
+            window.close();
+          }
+        } catch (e) {
+          window.close();
+        }
+      });
+    }
+
+    function initTransparency() {
+      const saved = Number(localStorage.getItem('sveDebugTransparencyPercent'));
+      if (!Number.isNaN(saved) && saved >= 0 && saved <= 90) {
+        transparencyPercent = saved;
+      }
+      applyTransparency();
+      const sliderEl = document.getElementById('transparencySlider');
+      if (sliderEl) {
+        sliderEl.value = String(transparencyPercent);
+      }
+      const valueEl = document.getElementById('transparencyValue');
+      if (valueEl) {
+        valueEl.textContent = transparencyPercent + '%';
+      }
+    }
+
+    function applyTransparency() {
+      const panelAlpha = Math.max(0.10, Math.min(1, 1 - (transparencyPercent / 100)));
+      const titleAlpha = Math.max(0.15, Math.min(1, panelAlpha + 0.20));
+      document.documentElement.style.setProperty('--inspector-panel-alpha', panelAlpha.toFixed(2));
+      document.documentElement.style.setProperty('--inspector-title-alpha', titleAlpha.toFixed(2));
+    }
+
+    function onTransparencyChange(value) {
+      const parsed = Number(value);
+      if (Number.isNaN(parsed)) return;
+      transparencyPercent = Math.max(0, Math.min(90, parsed));
+      localStorage.setItem('sveDebugTransparencyPercent', String(transparencyPercent));
+      applyTransparency();
+      const valueEl = document.getElementById('transparencyValue');
+      if (valueEl) {
+        valueEl.textContent = transparencyPercent + '%';
+      }
+    }
+
+    function startTransparencyDrag() {
+      isAdjustingTransparency = true;
+    }
+
+    function endTransparencyDrag() {
+      isAdjustingTransparency = false;
+      if (lastState) renderState(lastState);
+    }
+
+    function startPolling() {
+      stopPolling();
+      if (autoRefresh) {
+        intervalId = setInterval(fetchAndRender, 1000);
+      }
+    }
+
+    function stopPolling() {
+      if (intervalId) {
+        clearInterval(intervalId);
+        intervalId = null;
+      }
+    }
+
+    function toggleAutoRefresh() {
+      autoRefresh = !autoRefresh;
+      if (autoRefresh) startPolling();
+      else stopPolling();
+      updateTopControls();
+      updateStatusBar(lastState);
+    }
+
+    function updateTopControls() {
+      const autoBtn = document.getElementById('autoRefreshBtn');
+      if (!autoBtn) return;
+      autoBtn.textContent = autoRefresh ? '\u25CF Auto 1s' : '\u25CB Auto 1s';
+      if (autoRefresh) autoBtn.classList.add('active');
+      else autoBtn.classList.remove('active');
+    }
+
+    function updateStatusBar(state) {
+      const left = document.getElementById('statusLeft');
+      const right = document.getElementById('statusRight');
+      if (!left || !right) return;
+
+      const now = new Date().toLocaleTimeString();
+      const pulseClass = autoRefresh ? 'pulse' : 'pulse paused';
+      left.innerHTML = '<span class="' + pulseClass + '"></span>' + (autoRefresh ? 'Live' : 'Paused') + ' \u2014 ' + now;
+
+      if (!state) {
+        right.textContent = '0 clips \u00B7 0 shifts \u00B7 0 plays \u00B7 0 scores';
+        return;
+      }
+
+      right.textContent =
+        state.timeline_clips.length + ' clips \u00B7 ' +
+        state.player_shifts.length + ' shifts \u00B7 ' +
+        state.plays.length + ' plays \u00B7 ' +
+        state.score_events.length + ' scores';
+    }
+
+    async function fetchAndRender() {
+      if (!invoke) return;
+      try {
+        const [players, playerShifts, plays, scoreEvents, timelineClips] =
+          await Promise.all([
+            invoke('get_players'),
+            invoke('get_player_shifts'),
+            invoke('get_plays'),
+            invoke('get_score_events'),
+            invoke('get_timeline_clips'),
+          ]);
+
+        const onCourtIds = [
+          ...new Set(
+            playerShifts
+              .filter(s => s.exit_time == null)
+              .map(s => String(s.player_id))
+          ),
+        ];
+
+        const warnings = analyzeWarnings(players, playerShifts, plays);
+
+        const state = {
+          players,
+          player_shifts: playerShifts,
+          plays,
+          score_events: scoreEvents,
+          timeline_clips: timelineClips,
+          on_court_players: onCourtIds,
+          warnings,
+        };
+
+        lastState = state;
+        if (!isAdjustingTransparency) {
+          renderState(state);
+        }
+      } catch (err) {
+        const msg = String(err);
+        if (msg.includes('No project database is open')) {
+          document.getElementById('content').innerHTML =
+            '<div class="loading">No project loaded &mdash; open or create a project first.</div>';
+          updateStatusBar(null);
+        } else {
+          document.getElementById('content').innerHTML =
+            '<div class="warning-container"><h3>Error</h3><div class="warning-item">' + escapeHtml(msg) + '</div></div>';
+          updateStatusBar(null);
+        }
+      }
+    }
+
+    function analyzeWarnings(players, shifts, plays) {
+      const warnings = [];
+      const playerMap = buildPlayerMap(players);
+
+      const shiftsByPlayer = {};
+      for (const s of shifts) {
+        (shiftsByPlayer[s.player_id] ||= []).push(s);
+      }
+
+      for (const [pid, pshifts] of Object.entries(shiftsByPlayer)) {
+        const playerId = Number(pid);
+        const label = playerMap[playerId] || ('Player ' + playerId);
+
+        const openCount = pshifts.filter(s => s.exit_time == null).length;
+        if (openCount > 1) {
+          warnings.push('\u26A0 ' + label + ' has ' + openCount + ' open shifts.');
+        }
+
+        for (const s of pshifts) {
+          if (s.exit_time != null && s.exit_time < s.enter_time) {
+            warnings.push(
+              '\u26A0 ' + label + ' has a shift with negative duration (enter=' + s.enter_time.toFixed(2) + ', exit=' + s.exit_time.toFixed(2) + ').'
+            );
+          }
+        }
+
+        const sorted = [...pshifts].sort((a, b) => a.enter_time - b.enter_time);
+        for (let i = 1; i < sorted.length; i++) {
+          const prevEnd = sorted[i - 1].exit_time != null ? sorted[i - 1].exit_time : Infinity;
+          if (sorted[i].enter_time < prevEnd) {
+            warnings.push('\u26A0 ' + label + ' has overlapping shifts.');
+            break;
+          }
+        }
+      }
+
+      for (const play of plays) {
+        const hasCover = shifts.some(
+          s =>
+            s.player_id === play.player_id &&
+            s.enter_time <= play.timestamp &&
+            (s.exit_time == null || s.exit_time > play.timestamp)
+        );
+        if (!hasCover) {
+          const label = playerMap[play.player_id] || ('Player ' + play.player_id);
+          warnings.push(
+            '\u26A0 Play #' + play.id + ' (' + play.event_type + ') at ' + play.timestamp.toFixed(2) + 's has no covering shift for ' + label + '.'
+          );
+        }
+      }
+
+      return warnings;
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
+    }
+
+    function fmtTime(seconds) {
+      if (seconds == null || seconds === undefined) return '\u2014';
+      const m = Math.floor(seconds / 60);
+      const s = (seconds % 60).toFixed(1);
+      return m + ':' + s.padStart(4, '0');
+    }
+
+    function sourceBadge(source) {
+      const src = source || 'unknown';
+      const labels = { manual_sub: 'manual', auto_stat: 'auto', import: 'import' };
+      const label = labels[src] || src;
+      const cls = ['manual_sub', 'auto_stat', 'import'].includes(src) ? src : 'unknown';
+      return '<span class="badge badge-' + cls + '">' + escapeHtml(label) + '</span>';
+    }
+
+    function toggleSection(id) {
+      collapsedSections[id] = !collapsedSections[id];
+      renderState(lastState);
+    }
+
+    function buildPlayerMap(players) {
+      const map = {};
+      for (const p of players) map[p.id] = '#' + p.number + ' ' + p.name;
+      return map;
+    }
+
+    function renderState(state) {
+      if (!state) return;
+      const el = document.getElementById('content');
+      const playerMap = buildPlayerMap(state.players);
+      const onCourtSet = new Set(state.on_court_players.map(String));
+
+      let html = '';
+
+      if (state.warnings.length > 0) {
+        html += '<div class="warning-container"><h3>\u26A0 WARNINGS (' + state.warnings.length + ')</h3>';
+        for (const w of state.warnings) html += '<div class="warning-item">' + escapeHtml(w) + '</div>';
+        html += '</div>';
+      } else {
+        html += '<div class="no-warnings">\u2713 No warnings detected</div>';
+      }
+
+      html += renderSection('clips', 'Timeline Clips', state.timeline_clips.length, function() {
+        if (!state.timeline_clips.length) return '<div class="empty">No clips</div>';
+        var t = '<table><thead><tr><th>ID</th><th>Start</th><th>End</th><th>Duration</th><th>Order</th></tr></thead><tbody>';
+        for (const c of state.timeline_clips) {
+          var dur = (c.end_time - c.start_time).toFixed(1);
+          t += '<tr>' +
+            '<td title="' + escapeHtml(c.id) + '">' + escapeHtml(c.id.substring(0, 8)) + '\u2026</td>' +
+            '<td>' + fmtTime(c.start_time) + '</td>' +
+            '<td>' + fmtTime(c.end_time) + '</td>' +
+            '<td>' + dur + 's</td>' +
+            '<td>' + c.sort_order + '</td>' +
+          '</tr>';
+        }
+        return t + '</tbody></table>';
+      });
+
+      html += renderSection('shifts', 'Player Shifts', state.player_shifts.length, function() {
+        if (!state.player_shifts.length) return '<div class="empty">No shifts</div>';
+        var t = '<table><thead><tr><th>ID</th><th>Player</th><th>Enter</th><th>Exit</th><th>Source</th><th>Auto</th></tr></thead><tbody>';
+        for (const s of state.player_shifts) {
+          var isOnCourt = onCourtSet.has(String(s.player_id));
+          var playerLabel = playerMap[s.player_id] || ('ID:' + s.player_id);
+          var autoIcon = s.auto_generated_from_play_id ? '<span class="auto-icon">\uD83D\uDD01</span>' : '';
+          t += '<tr class="' + (isOnCourt ? 'on-court' : '') + '">' +
+            '<td>' + s.id + '</td>' +
+            '<td>' + escapeHtml(playerLabel) + '</td>' +
+            '<td>' + fmtTime(s.enter_time) + '</td>' +
+            '<td>' + (s.exit_time != null ? fmtTime(s.exit_time) : '<em>open</em>') + '</td>' +
+            '<td>' + sourceBadge(s.source) + '</td>' +
+            '<td>' + autoIcon + (s.auto_generated_from_play_id ? escapeHtml(String(s.auto_generated_from_play_id)) : '') + '</td>' +
+          '</tr>';
+        }
+        return t + '</tbody></table>';
+      });
+
+      html += renderSection('plays', 'Plays', state.plays.length, function() {
+        if (!state.plays.length) return '<div class="empty">No plays</div>';
+        var t = '<table><thead><tr><th>ID</th><th>Player</th><th>Type</th><th>Time</th><th>Window</th></tr></thead><tbody>';
+        for (const p of state.plays) {
+          var playerLabel = p.player_name ? ('#' + p.player_number + ' ' + p.player_name) : ('ID:' + p.player_id);
+          t += '<tr>' +
+            '<td>' + p.id + '</td>' +
+            '<td>' + escapeHtml(playerLabel) + '</td>' +
+            '<td>' + escapeHtml(p.event_type) + '</td>' +
+            '<td>' + fmtTime(p.timestamp) + '</td>' +
+            '<td>' + fmtTime(p.start_time) + ' \u2192 ' + fmtTime(p.end_time) + '</td>' +
+          '</tr>';
+        }
+        return t + '</tbody></table>';
+      });
+
+      html += renderSection('scores', 'Score Events', state.score_events.length, function() {
+        if (!state.score_events.length) return '<div class="empty">No score events</div>';
+        var t = '<table><thead><tr><th>ID</th><th>Team</th><th>Time</th><th>Score</th></tr></thead><tbody>';
+        for (const e of state.score_events) {
+          t += '<tr>' +
+            '<td>' + e.id + '</td>' +
+            '<td>' + escapeHtml(e.team) + '</td>' +
+            '<td>' + fmtTime(e.time) + '</td>' +
+            '<td>' + e.score + '</td>' +
+          '</tr>';
+        }
+        return t + '</tbody></table>';
+      });
+
+      el.innerHTML = html;
+      updateTopControls();
+      updateStatusBar(state);
+    }
+
+    function renderSection(id, title, count, contentFn) {
+      var isCollapsed = !!collapsedSections[id];
+      return '<div class="section">' +
+        '<div class="section-header ' + (isCollapsed ? 'collapsed' : '') + '" onclick="toggleSection(\'' + id + '\')">' +
+          '<h3>' + title + '</h3>' +
+          '<div>' +
+            '<span class="count">' + count + '</span>' +
+            '<span class="chevron">\u25BC</span>' +
+          '</div>' +
+        '</div>' +
+        '<div class="section-body ' + (isCollapsed ? 'collapsed' : '') + '">' +
+          (isCollapsed ? '' : contentFn()) +
+        '</div>' +
+      '</div>';
+    }
+  </script>
+</body>
+</html>

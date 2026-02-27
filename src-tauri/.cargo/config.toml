@@ -1,0 +1,10 @@
+# Increase main thread stack size to 8MB on Windows to prevent stack overflow
+# in debug builds where generate_handler! creates large dispatch frames.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-args=/STACK:8388608"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "link-args=/STACK:8388608"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "link-args=/STACK:8388608"]
