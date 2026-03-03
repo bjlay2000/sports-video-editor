@@ -163,7 +163,6 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_timeline_sort ON timeline_clips(sort_order);
         CREATE INDEX IF NOT EXISTS idx_shifts_player ON player_shifts(player_id);
         CREATE INDEX IF NOT EXISTS idx_shifts_enter ON player_shifts(enter_time);
-        CREATE INDEX IF NOT EXISTS idx_shifts_source_play ON player_shifts(source, auto_generated_from_play_id);
         CREATE INDEX IF NOT EXISTS idx_plays_timestamp ON plays(timestamp);
         CREATE INDEX IF NOT EXISTS idx_plays_player ON plays(player_id);
         CREATE INDEX IF NOT EXISTS idx_plays_event ON plays(event_type);
@@ -220,6 +219,12 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             ));
         }
     }
+
+    // Create this index after the migrations above ensure the columns exist.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_shifts_source_play ON player_shifts(source, auto_generated_from_play_id);",
+    )
+    .map_err(|e| format!("Failed to create idx_shifts_source_play index: {}", e))?;
 
     Ok(())
 }
@@ -679,6 +684,53 @@ mod commands {
             )
             .map_err(|e| e.to_string())?;
 
+        stmt
+            .query_row(params![id], |row| {
+                Ok(Play {
+                    id: row.get(0)?,
+                    timestamp: row.get(1)?,
+                    player_id: row.get(2)?,
+                    event_type: row.get(3)?,
+                    start_time: row.get(4)?,
+                    end_time: row.get(5)?,
+                    player_name: row.get(6).ok(),
+                    player_number: row.get(7).ok(),
+                })
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub fn update_play_event_and_player(
+        state: State<DbState>,
+        id: i64,
+        event_type: Option<String>,
+        player_id: Option<i64>,
+    ) -> Result<Play, String> {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
+        if let Some(ref et) = event_type {
+            conn.execute(
+                "UPDATE plays SET event_type = ?2 WHERE id = ?1",
+                params![id, et],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if let Some(pid) = player_id {
+            conn.execute(
+                "UPDATE plays SET player_id = ?2 WHERE id = ?1",
+                params![id, pid],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT p.id, p.timestamp, p.player_id, p.event_type, p.start_time, p.end_time, pl.name, pl.number
+                FROM plays p
+                LEFT JOIN players pl ON pl.id = p.player_id
+                WHERE p.id = ?1",
+            )
+            .map_err(|e| e.to_string())?;
         stmt
             .query_row(params![id], |row| {
                 Ok(Play {
@@ -1697,6 +1749,7 @@ fn main() {
             commands::get_plays_by_type,
             commands::delete_play,
             commands::update_play_window,
+            commands::update_play_event_and_player,
             commands::update_score,
             commands::get_game,
             commands::open_project_db,

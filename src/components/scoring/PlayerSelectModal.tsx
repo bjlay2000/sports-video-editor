@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useAppStore } from "../../store/appStore";
 import { useVideoStore } from "../../store/videoStore";
 import { DatabaseService } from "../../services/DatabaseService";
@@ -49,6 +49,26 @@ export function PlayerSelectModal() {
   const pushToast = useToastStore((s) => s.pushToast);
   const [step, setStep] = useState<SelectionStep>("primary");
   const [followUpContext, setFollowUpContext] = useState<FollowUpContext | null>(null);
+  const [modalLeft, setModalLeft] = useState<number | null>(null);
+  const modalRef = useRef<HTMLDivElement>(null);
+
+  useLayoutEffect(() => {
+    const updatePosition = () => {
+      const panel = document.getElementById("scoring-panel");
+      if (!panel) return;
+      const rect = panel.getBoundingClientRect();
+      setModalLeft(rect.left + rect.width / 2);
+    };
+    updatePosition();
+    const observer = new ResizeObserver(updatePosition);
+    const panel = document.getElementById("scoring-panel");
+    if (panel) observer.observe(panel);
+    window.addEventListener("resize", updatePosition);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", updatePosition);
+    };
+  }, []);
 
   const persistShiftsFromStore = async () => {
     await ProjectService.ensureProjectDbOpen();
@@ -233,10 +253,10 @@ export function PlayerSelectModal() {
 
   const modalTitle =
     step === "primary"
-      ? `Select Player — ${describeStat(pendingStat)}`
+      ? <><span className="text-gray-400">Select Player — </span><span className="text-accent">{describeStat(pendingStat)}</span></>
       : step === "assist"
-        ? "Select Assist Player"
-        : "Select Rebound Player";
+        ? <>Select <span className="text-blue-400 font-bold">Assist</span> Player</>
+        : <>Select <span className="text-yellow-400 font-bold">Rebound</span> Player</>;
 
   const onSelect =
     step === "primary"
@@ -246,8 +266,16 @@ export function PlayerSelectModal() {
         : handleReboundSelect;
 
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
-      <div className="bg-panel border border-panel-border rounded-lg p-5 w-80 max-h-96 overflow-y-auto">
+    <div className="fixed inset-0 bg-black/60 z-50">
+      <div
+        ref={modalRef}
+        className="bg-panel border border-panel-border rounded-lg p-5 w-80 max-h-[calc(100vh-4rem)] overflow-y-auto absolute"
+        style={{
+          left: modalLeft !== null ? `${modalLeft}px` : "50%",
+          top: "50%",
+          transform: "translate(-50%, -50%)",
+        }}
+      >
         <div className="flex justify-between items-center mb-4">
           <h2 className="text-lg font-semibold text-white">{modalTitle}</h2>
           <button

@@ -123,3 +123,12 @@ export interface RenderFrameState {
   videoTransform: VideoTransform;
   scoreboard: ScoreboardState;
 }
+
+/* ---------- Viewport State ---------- */
+
+/** Single source of truth for the preview/export viewport. */
+export interface ViewportState {
+  zoom: number;    // 1 = 100%, 2 = 200%, etc.
+  panX: number;    // video native pixel coords
+  panY: number;    // video native pixel coords
+}

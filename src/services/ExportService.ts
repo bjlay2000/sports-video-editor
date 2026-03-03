@@ -311,6 +311,9 @@ function buildExportConfig(
     outputPath,
     exportWidth: exportDimensions.width,
     exportHeight: exportDimensions.height,
+    sourceWidth,
+    sourceHeight,
+    viewport: videoState.viewport,
     fps: 30,
     qualityProfile,
     onProgress: options?.onProgress

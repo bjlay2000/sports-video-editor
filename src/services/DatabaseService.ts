@@ -119,6 +119,14 @@ export class DatabaseService {
     });
   }
 
+  static async updatePlayEventAndPlayer(
+    id: number,
+    eventType: string | null,
+    playerId: number | null
+  ): Promise<Play> {
+    return invoke<Play>("update_play_event_and_player", { id, eventType, playerId });
+  }
+
   static async savePlaysBulk(plays: Play[]): Promise<void> {
     return invoke<void>("save_plays_bulk", { plays });
   }

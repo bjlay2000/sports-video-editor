@@ -43,6 +43,8 @@
     let collapsedSections = {};
     let transparencyPercent = 25;
     let isAdjustingTransparency = false;
+    let lastShiftNewestId = null;
+    let lastShiftCount = 0;
     let bootAttempts = 0;
     const MAX_BOOT_ATTEMPTS = 100;
 
@@ -324,6 +326,61 @@
       const playerMap = buildPlayerMap(state.players);
       const onCourtSet = new Set(state.on_court_players.map(String));
 
+      // Start from original working behavior (on-court by player id),
+      // but keep only the latest OPEN shift per on-court player.
+      // This is order-independent so project-load row ordering can't break highlights.
+      const latestOpenShiftByPlayer = new Map();
+      for (const s of state.player_shifts) {
+        const pid = String(s.player_id);
+        if (!onCourtSet.has(pid)) continue;
+        if (s.exit_time != null) continue;
+
+        const current = latestOpenShiftByPlayer.get(pid);
+        if (!current) {
+          latestOpenShiftByPlayer.set(pid, s);
+          continue;
+        }
+
+        const currentId = Number(current.id ?? 0);
+        const nextId = Number(s.id ?? 0);
+        if (Number.isFinite(nextId) && Number.isFinite(currentId) && nextId > currentId) {
+          latestOpenShiftByPlayer.set(pid, s);
+          continue;
+        }
+
+        const currentEnter = Number(current.enter_time ?? 0);
+        const nextEnter = Number(s.enter_time ?? 0);
+        if (nextEnter > currentEnter) {
+          latestOpenShiftByPlayer.set(pid, s);
+        }
+      }
+      const highlightShiftIds = new Set(
+        Array.from(latestOpenShiftByPlayer.values()).map((s) => String(s.id))
+      );
+
+      const newestShiftId = state.player_shifts.length > 0
+        ? String(state.player_shifts[state.player_shifts.length - 1].id)
+        : null;
+      const hasNewShiftRecord =
+        state.player_shifts.length > lastShiftCount ||
+        (newestShiftId != null && newestShiftId !== lastShiftNewestId);
+
+      // Save scroll positions before rebuilding HTML
+      const outerScroll = el.parentElement;
+      const outerScrollTop = outerScroll ? outerScroll.scrollTop : 0;
+      const outerAtBottom = outerScroll
+        ? (outerScroll.scrollHeight - outerScroll.scrollTop - outerScroll.clientHeight < 80)
+        : false;
+      const sectionScrolls = {};
+      for (const body of el.querySelectorAll('.section-body[data-id]')) {
+        const sectionId = body.dataset.id;
+        if (!sectionId) continue;
+        sectionScrolls[sectionId] = {
+          top: body.scrollTop,
+          atBottom: body.scrollHeight - body.scrollTop - body.clientHeight < 24,
+        };
+      }
+
       let html = '';
 
       if (state.warnings.length > 0) {
@@ -354,7 +411,7 @@
         if (!state.player_shifts.length) return '<div class="empty">No shifts</div>';
         var t = '<table><thead><tr><th>ID</th><th>Player</th><th>Enter</th><th>Exit</th><th>Source</th><th>Auto</th></tr></thead><tbody>';
         for (const s of state.player_shifts) {
-          var isOnCourt = onCourtSet.has(String(s.player_id));
+          var isOnCourt = highlightShiftIds.has(String(s.id));
           var playerLabel = playerMap[s.player_id] || ('ID:' + s.player_id);
           var autoIcon = s.auto_generated_from_play_id ? '<span class="auto-icon">\uD83D\uDD01</span>' : '';
           t += '<tr class="' + (isOnCourt ? 'on-court' : '') + '">' +
@@ -400,6 +457,36 @@
       });
 
       el.innerHTML = html;
+
+      // Restore scroll positions after rebuild
+      if (outerScroll) {
+        if (outerAtBottom) {
+          outerScroll.scrollTop = outerScroll.scrollHeight;
+        } else {
+          outerScroll.scrollTop = outerScrollTop;
+        }
+      }
+      for (const body of el.querySelectorAll('.section-body[data-id]')) {
+        const sectionId = body.dataset.id;
+        if (!sectionId) continue;
+        const saved = sectionScrolls[sectionId];
+        if (!saved) continue;
+        if (sectionId === 'shifts') {
+          if (hasNewShiftRecord) {
+            body.scrollTop = body.scrollHeight;
+          } else {
+            body.scrollTop = saved.top;
+          }
+        } else if (saved.atBottom) {
+          body.scrollTop = body.scrollHeight;
+        } else {
+          body.scrollTop = saved.top;
+        }
+      }
+
+      lastShiftNewestId = newestShiftId;
+      lastShiftCount = state.player_shifts.length;
+
       updateTopControls();
       updateStatusBar(state);
     }
@@ -414,7 +501,7 @@
             '<span class="chevron">\u25BC</span>' +
           '</div>' +
         '</div>' +
-        '<div class="section-body ' + (isCollapsed ? 'collapsed' : '') + '">' +
+        '<div class="section-body ' + (isCollapsed ? 'collapsed' : '') + '" data-id="' + id + '">' +
           (isCollapsed ? '' : contentFn()) +
         '</div>' +
       '</div>';

@@ -105,13 +105,26 @@ const getRecentPlayStyle = (eventType: string) => {
   }
 };
 
+const ALL_STAT_TYPES = [
+  "2PT", "2PT_MISS", "3PT", "3PT_MISS", "FT", "FT_MISS",
+  "AST", "REB", "STL", "BLK", "TO", "FOUL",
+] as const;
+
 export function TimelinePanel() {
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const recentListRef = useRef<HTMLDivElement>(null);
   const playheadDraggingRef = useRef(false);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const [containerWidth, setContainerWidth] = useState(800);
+  const [recentViewportHeight, setRecentViewportHeight] = useState(210);
   const [recentPlaysScrollTop, setRecentPlaysScrollTop] = useState(0);
+  const [filterPlayers, setFilterPlayers] = useState<string[]>([]);
+  const [filterStats, setFilterStats] = useState<string[]>([]);
+  const [playerFilterOpen, setPlayerFilterOpen] = useState(false);
+  const [statsFilterOpen, setStatsFilterOpen] = useState(false);
+  const [editingMarkerId, setEditingMarkerId] = useState<number | null>(null);
+  const [editMode, setEditMode] = useState<"menu" | "type" | "player" | null>(null);
   const lastVideoPathRef = useRef<string | null>(null);
 
   const pixelsPerSecond = useTimelineStore((s) => s.pixelsPerSecond);
@@ -163,6 +176,7 @@ export function TimelinePanel() {
   const removeMarkersByIds = useAppStore((s) => s.removeMarkersByIds);
   const updateMarker = useAppStore((s) => s.updateMarker);
   const bumpPlayedPercentRefresh = useAppStore((s) => s.bumpPlayedPercentRefresh);
+  const players = useAppStore((s) => s.players);
 
   const persistSegmentsToDb = useCallback(async () => {
     await ProjectService.ensureProjectDbOpen();
@@ -191,6 +205,19 @@ export function TimelinePanel() {
     if (containerRef.current) {
       setContainerWidth(containerRef.current.clientWidth);
     }
+  }, []);
+
+  useEffect(() => {
+    const observer = new ResizeObserver(() => {
+      if (recentListRef.current) {
+        setRecentViewportHeight(recentListRef.current.clientHeight);
+      }
+    });
+    if (recentListRef.current) {
+      setRecentViewportHeight(recentListRef.current.clientHeight);
+      observer.observe(recentListRef.current);
+    }
+    return () => observer.disconnect();
   }, []);
 
   useEffect(() => {
@@ -308,6 +335,25 @@ export function TimelinePanel() {
     return Math.min(total, sourceToProject(playheadTime));
   }, [duration, playheadTime, projectDuration, sourceToProject]);
 
+  // Auto-center timeline when playhead goes off-screen during playback
+  useEffect(() => {
+    if (!isPlaying || playheadDraggingRef.current) return;
+    const scroller = scrollRef.current;
+    if (!scroller) return;
+    const scrollWidth = scroller.scrollWidth;
+    if (scrollWidth <= containerWidth) return;
+    const timelineDur = projectDuration || duration || 1;
+    const ratio = projectPlayhead / timelineDur;
+    const playheadPixel = ratio * scrollWidth;
+    const currentScrollX = scroller.scrollLeft;
+    if (playheadPixel < currentScrollX || playheadPixel > currentScrollX + containerWidth) {
+      const target = playheadPixel - containerWidth / 2;
+      const clamped = Math.max(0, Math.min(target, scrollWidth - containerWidth));
+      scroller.scrollLeft = clamped;
+      setScrollX(clamped);
+    }
+  }, [isPlaying, playheadTime, projectPlayhead, projectDuration, duration, containerWidth, setScrollX]);
+
   const handleSeek = useCallback(
     (projectTime: number) => {
       if (duration <= 0) return;
@@ -331,6 +377,20 @@ export function TimelinePanel() {
     if (!isTimeWithinSegments(anchor)) return;
     const projectTime = sourceToProject(anchor);
     handleSeek(projectTime);
+  };
+
+  const handleRecentPlayClick = (marker: TimelineMarker) => {
+    const preferredStart =
+      typeof marker.start_time === "number" && Number.isFinite(marker.start_time)
+        ? marker.start_time
+        : marker.time;
+    const anchor = isTimeWithinSegments(preferredStart) ? preferredStart : marker.time;
+    const projectTime = sourceToProject(anchor);
+    handleSelectMarker(marker.id, false);
+    handleSeek(projectTime);
+    requestAnimationFrame(() => {
+      handleCenterOnPlayhead();
+    });
   };
 
   const handleSelectMarker = (markerId: number, additive: boolean) => {
@@ -429,15 +489,39 @@ export function TimelinePanel() {
     .filter((marker) => isTimeWithinSegments(marker.time))
     .sort((a, b) => b.time - a.time);
 
+  const uniquePlayerNames = useMemo(() => {
+    const names = new Set<string>();
+    for (const m of recentTimelinePlays) {
+      if (m.player_name) names.add(m.player_name);
+    }
+    return [...names].sort();
+  }, [recentTimelinePlays]);
+
+  const uniqueStatTypes = useMemo(() => {
+    const types = new Set<string>();
+    for (const m of recentTimelinePlays) {
+      types.add(m.event_type);
+    }
+    return [...types].sort();
+  }, [recentTimelinePlays]);
+
+  const filteredRecentPlays = useMemo(() => {
+    return recentTimelinePlays.filter((m) => {
+      if (filterPlayers.length > 0 && !filterPlayers.includes(m.player_name ?? "")) return false;
+      if (filterStats.length > 0 && !filterStats.includes(m.event_type)) return false;
+      return true;
+    });
+  }, [recentTimelinePlays, filterPlayers, filterStats]);
+
   const recentRowHeight = 56;
-  const recentViewportHeight = 210;
+  const recentViewportSafeHeight = Math.max(1, recentViewportHeight);
   const recentOverscanRows = 6;
   const recentStartIndex = Math.max(0, Math.floor(recentPlaysScrollTop / recentRowHeight) - recentOverscanRows);
   const recentEndIndex = Math.min(
-    recentTimelinePlays.length,
-    Math.ceil((recentPlaysScrollTop + recentViewportHeight) / recentRowHeight) + recentOverscanRows,
+    filteredRecentPlays.length,
+    Math.ceil((recentPlaysScrollTop + recentViewportSafeHeight) / recentRowHeight) + recentOverscanRows,
   );
-  const visibleRecentTimelinePlays = recentTimelinePlays.slice(recentStartIndex, recentEndIndex);
+  const visibleRecentTimelinePlays = filteredRecentPlays.slice(recentStartIndex, recentEndIndex);
 
   const handleDeleteSelected = async () => {
     if (selectedSegmentId) {
@@ -562,9 +646,14 @@ export function TimelinePanel() {
 
   const handleCenterOnPlayhead = () => {
     if (!scrollRef.current) return;
-    const target = Math.max(0, playheadTime * pixelsPerSecond - containerWidth / 2);
-    scrollRef.current.scrollTo({ left: target, behavior: "smooth" });
-    setScrollX(target);
+    const scrollWidth = scrollRef.current.scrollWidth;
+    const timelineDur = projectDuration || duration || 1;
+    const centerRatio = playheadTime / timelineDur;
+    const target = centerRatio * scrollWidth;
+    const offset = target - containerWidth / 2;
+    const clamped = Math.max(0, Math.min(offset, scrollWidth - containerWidth));
+    scrollRef.current.scrollTo({ left: clamped, behavior: "smooth" });
+    setScrollX(clamped);
   };
 
   const handlePlayheadDragStart = useCallback(() => {
@@ -608,7 +697,7 @@ export function TimelinePanel() {
       // - base speed slowed by 1/2
       // - every 2% deeper into the edge zone adds +25% acceleration
       const BASE_SCROLL_SPEED = 0.175;
-      const accelerationSteps = Math.floor(proximityRatio / 0.02);
+      const accelerationSteps = Math.floor(proximityRatio / 0.10);
       const accelerationMultiplier = 1 + accelerationSteps * 0.25;
 
       const current = scroller.scrollLeft;
@@ -634,7 +723,7 @@ export function TimelinePanel() {
 
   return (
     <div
-      className="bg-surface-dark border-b border-panel-border flex flex-col shrink-0"
+      className="bg-surface-dark border-b border-panel-border flex flex-col h-full min-h-0"
       tabIndex={0}
       onKeyDown={(event) => {
         const target = event.target as HTMLElement | null;
@@ -660,6 +749,12 @@ export function TimelinePanel() {
         className="hidden"
         onChange={handleImageOverlaySelected}
       />
+      {(playerFilterOpen || statsFilterOpen) && (
+        <div
+          className="fixed inset-0 z-40"
+          onClick={() => { setPlayerFilterOpen(false); setStatsFilterOpen(false); }}
+        />
+      )}
       <div className="flex flex-wrap items-center gap-3 border-b border-panel-border px-4 py-2 text-xs text-gray-300">
         <div className="flex flex-wrap items-center gap-2">
           <div className="flex items-center gap-2 rounded-lg border border-panel-border bg-panel/70 px-2 py-1">
@@ -707,7 +802,12 @@ export function TimelinePanel() {
             </div>
           </div>
           <button onClick={handleAddMarker} className="px-2 py-1 bg-panel rounded hover:bg-panel-border transition-colors">
-            ✂ Marker
+            <span className="flex items-center gap-1">
+              <svg width="16" height="16" viewBox="0 0 24 24">
+                <path fill="#ff3b3b" d="M12 2C8 2 5 5 5 9c0 5 7 13 7 13s7-8 7-13c0-4-3-7-7-7z"/>
+              </svg>
+              <span className="text-xs uppercase">Marker</span>
+            </span>
           </button>
           <button
             onClick={toggleKeyframeMode}
@@ -749,20 +849,17 @@ export function TimelinePanel() {
           >
             ↩ Undo
           </button>
-        </div>
-        <div className="flex flex-wrap items-center gap-3 ml-auto">
-          <div className="flex items-center gap-2">
-            <span className="text-gray-500">Video Zoom</span>
+          <div className="flex items-center gap-2 rounded-lg border border-panel-border bg-panel/70 px-2 py-1">
+            <span className="text-gray-500 text-[10px] uppercase tracking-[0.2em]">Video Zoom</span>
             <input
               type="range"
-              min={0}
+              min={100}
               max={300}
               value={zoomPercent}
               onChange={(e) => setZoomPercent(Number(e.target.value))}
             />
             <span className="w-12 text-right">{zoomPercent}%</span>
-          </div>
-          <div className="flex items-center gap-2 text-xs">
+            <div className="h-6 w-px bg-panel-border/60" aria-hidden="true" />
             <button onClick={zoomOut} className="px-2 py-1 bg-panel rounded hover:bg-panel-border transition-colors">
               −
             </button>
@@ -772,12 +869,82 @@ export function TimelinePanel() {
             </button>
           </div>
         </div>
+        <div className="flex flex-wrap items-center gap-2 ml-auto">
+          {/* Player filter */}
+          <div className="relative">
+            <button
+              onClick={() => { setPlayerFilterOpen((p) => !p); setStatsFilterOpen(false); }}
+              className={`px-2 py-1 rounded text-[11px] transition-colors border ${filterPlayers.length > 0 ? "bg-accent/20 border-accent/50 text-accent" : "bg-panel border-panel-border hover:bg-panel-border text-gray-300"}`}
+            >
+              Player {filterPlayers.length > 0 ? `(${filterPlayers.length})` : "▾"}
+            </button>
+            {playerFilterOpen && uniquePlayerNames.length > 0 && (
+              <div className="absolute right-0 top-full mt-1 bg-surface border border-panel-border rounded shadow-xl z-50 min-w-[140px] max-h-48 overflow-y-auto">
+                <button
+                  className="w-full text-left px-3 py-1.5 text-[11px] text-gray-400 hover:bg-panel-border/40 border-b border-panel-border/40"
+                  onClick={() => setFilterPlayers([])}
+                >
+                  Clear filter
+                </button>
+                {uniquePlayerNames.map((name) => (
+                  <label key={name} className="flex items-center gap-2 px-3 py-1.5 text-[11px] text-gray-200 hover:bg-panel-border/40 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={filterPlayers.includes(name)}
+                      onChange={() =>
+                        setFilterPlayers((prev) =>
+                          prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name]
+                        )
+                      }
+                      className="accent-accent"
+                    />
+                    {name}
+                  </label>
+                ))}
+              </div>
+            )}
+          </div>
+          {/* Stats filter */}
+          <div className="relative">
+            <button
+              onClick={() => { setStatsFilterOpen((p) => !p); setPlayerFilterOpen(false); }}
+              className={`px-2 py-1 rounded text-[11px] transition-colors border ${filterStats.length > 0 ? "bg-accent/20 border-accent/50 text-accent" : "bg-panel border-panel-border hover:bg-panel-border text-gray-300"}`}
+            >
+              Stats {filterStats.length > 0 ? `(${filterStats.length})` : "▾"}
+            </button>
+            {statsFilterOpen && uniqueStatTypes.length > 0 && (
+              <div className="absolute right-0 top-full mt-1 bg-surface border border-panel-border rounded shadow-xl z-50 min-w-[140px] max-h-48 overflow-y-auto">
+                <button
+                  className="w-full text-left px-3 py-1.5 text-[11px] text-gray-400 hover:bg-panel-border/40 border-b border-panel-border/40"
+                  onClick={() => setFilterStats([])}
+                >
+                  Clear filter
+                </button>
+                {uniqueStatTypes.map((type) => (
+                  <label key={type} className="flex items-center gap-2 px-3 py-1.5 text-[11px] text-gray-200 hover:bg-panel-border/40 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={filterStats.includes(type)}
+                      onChange={() =>
+                        setFilterStats((prev) =>
+                          prev.includes(type) ? prev.filter((t) => t !== type) : [...prev, type]
+                        )
+                      }
+                      className="accent-accent"
+                    />
+                    {formatMarkerLabel(type)}
+                  </label>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
       </div>
-      <div className="flex">
-        <div ref={containerRef} className="flex-1 overflow-hidden bg-[#050509]">
+      <div className="flex flex-1 min-h-0">
+        <div ref={containerRef} className="flex-1 min-h-0 overflow-hidden bg-[#050509]">
           <div
             ref={scrollRef}
-            className="h-[260px] overflow-auto"
+            className="h-full min-h-0 overflow-auto"
             onWheel={handleWheel}
             onScroll={handleScroll}
           >
@@ -812,54 +979,140 @@ export function TimelinePanel() {
             />
           </div>
         </div>
-        <aside className="w-72 h-[260px] border-l border-panel-border bg-surface px-4 py-4 flex flex-col gap-3">
+        <aside className="relative z-20 w-72 min-w-72 border-l border-panel-border bg-surface px-4 py-4 flex flex-col gap-3 min-h-0">
           <div className="flex items-center justify-between text-[11px] uppercase tracking-[0.25em] text-gray-500">
             <span>Recent Plays</span>
-            <span className="text-[10px] text-gray-600">{recentTimelinePlays.length}</span>
+            <span className="text-[10px] text-gray-600">{filteredRecentPlays.length}{filterPlayers.length > 0 || filterStats.length > 0 ? ` / ${recentTimelinePlays.length}` : ""}</span>
           </div>
           <div
-            className="flex-1 overflow-y-auto pr-1"
-            style={{ height: `${recentViewportHeight}px` }}
+            ref={recentListRef}
+            className="flex-1 min-h-0 overflow-y-auto pr-1"
             onScroll={(event) => setRecentPlaysScrollTop(event.currentTarget.scrollTop)}
           >
-            {recentTimelinePlays.length === 0 && (
-              <span className="text-gray-600 text-xs">Tag a stat to see it here.</span>
+            {filteredRecentPlays.length === 0 && (
+              <span className="text-gray-600 text-xs">{recentTimelinePlays.length === 0 ? "Tag a stat to see it here." : "No plays match the filter."}</span>
             )}
-            <div style={{ height: `${recentTimelinePlays.length * recentRowHeight}px`, position: "relative" }}>
+            <div style={{ height: `${filteredRecentPlays.length * recentRowHeight}px`, position: "relative" }}>
               {visibleRecentTimelinePlays.map((marker, idx) => {
                 const style = getRecentPlayStyle(marker.event_type);
+                const isEditing = editingMarkerId === marker.id;
+                const markerTop = (recentStartIndex + idx) * recentRowHeight;
+                const openDown = markerTop < recentViewportSafeHeight / 2;
 
                 return (
-                  <button
+                  <div
                     key={`recent-timeline-${marker.id}`}
-                    className={`group absolute left-0 right-0 flex items-center justify-between rounded-lg border bg-white/5 px-3 py-2 text-[11px] text-gray-200 transition hover:bg-white/10 ${style.borderClass}`}
+                    className="absolute left-0 right-0"
                     style={{
-                      top: `${(recentStartIndex + idx) * recentRowHeight}px`,
+                      top: `${markerTop}px`,
                       height: `${recentRowHeight - 6}px`,
                     }}
-                    onClick={() => {
-                      handleSelectMarker(marker.id, false);
-                      handleMarkerClick(marker);
-                    }}
-                    onDoubleClick={() => handleMarkerClick(marker)}
                   >
-                    <div className="flex flex-col text-left">
-                      <span className={`text-[10px] uppercase tracking-wide ${style.statTextClass}`}>{formatMarkerLabel(marker.event_type)}</span>
-                      <strong className="text-white text-xs">{marker.player_name ?? marker.label ?? "Play"}</strong>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono text-[11px] text-gray-400">{formatClock(marker.time)}</span>
-                      <span
-                        className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-red-400"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          void PlayCoordinator.removePlays([marker.id]);
-                        }}
+                    <button
+                      className={`group w-full h-full flex items-center justify-between rounded-lg border bg-white/5 px-3 py-2 text-[11px] text-gray-200 transition hover:bg-white/10 ${style.borderClass}`}
+                      onClick={() => {
+                        if (isEditing) { setEditingMarkerId(null); setEditMode(null); return; }
+                        handleRecentPlayClick(marker);
+                      }}
+                      onDoubleClick={() => handleRecentPlayClick(marker)}
+                    >
+                      <div className="flex flex-col text-left">
+                        <span className={`text-[10px] uppercase tracking-wide ${style.statTextClass}`}>{formatMarkerLabel(marker.event_type)}</span>
+                        <strong className="text-white text-xs">{marker.player_name ?? marker.label ?? "Play"}</strong>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="font-mono text-[11px] text-gray-400">{formatClock(marker.time)}</span>
+                        <span
+                          className={`text-[13px] transition-colors ${isEditing ? "opacity-100 text-accent" : "opacity-0 group-hover:opacity-100 text-gray-500 hover:text-accent"}`}
+                          title="Edit play"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            if (isEditing) { setEditingMarkerId(null); setEditMode(null); }
+                            else { setEditingMarkerId(marker.id); setEditMode("menu"); }
+                          }}
+                        >
+                          ✎
+                        </span>
+                        <span
+                          className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-red-400"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void PlayCoordinator.removePlays([marker.id]);
+                          }}
+                        >
+                          🗑
+                        </span>
+                      </div>
+                    </button>
+                    {isEditing && (
+                      <div
+                        className="absolute right-0 z-[120] bg-panel border border-panel-border rounded-lg shadow-xl p-2 min-w-[220px] max-w-[280px] max-h-[220px] overflow-y-auto"
+                        style={openDown ? { top: "calc(100% + 4px)" } : { bottom: "calc(100% + 4px)" }}
+                        onClick={(e) => e.stopPropagation()}
                       >
-                        🗑
-                      </span>
-                    </div>
-                  </button>
+                        {editMode === "menu" && (
+                          <div className="flex items-center gap-1 text-xs text-gray-300">
+                            <span className="text-gray-400">Change</span>
+                            <button
+                              className="text-center text-xs px-2 py-1 rounded hover:bg-panel-border text-gray-200 transition-colors"
+                              onClick={() => setEditMode("type")}
+                            >
+                              Play
+                            </button>
+                            <span className="text-gray-500">|</span>
+                            <button
+                              className="text-center text-xs px-2 py-1 rounded hover:bg-panel-border text-gray-200 transition-colors"
+                              onClick={() => setEditMode("player")}
+                            >
+                              Player
+                            </button>
+                          </div>
+                        )}
+                        {editMode === "type" && (
+                          <div className="flex flex-col gap-1">
+                            <div className="text-[10px] uppercase tracking-wider text-gray-500 px-1 pb-1">Select type</div>
+                            <div className="grid grid-cols-2 gap-1">
+                              {ALL_STAT_TYPES.map((t) => (
+                                <button
+                                  key={t}
+                                  className={`text-center text-[11px] px-2 py-1 rounded transition-colors ${t === marker.event_type ? "bg-accent/20 text-accent" : "hover:bg-panel-border text-gray-300"}`}
+                                  onClick={async () => {
+                                    await DatabaseService.updatePlayEventAndPlayer(marker.id, t, null);
+                                    await PlayCoordinator.refreshPlaysFromDatabase();
+                                    setEditingMarkerId(null);
+                                    setEditMode(null);
+                                  }}
+                                >
+                                  {formatMarkerLabel(t)}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {editMode === "player" && (
+                          <div className="flex flex-col gap-1">
+                            <div className="text-[10px] uppercase tracking-wider text-gray-500 px-1 pb-1">Select player</div>
+                            <div className="grid grid-cols-2 gap-1">
+                              {players.map((p) => (
+                                <button
+                                  key={p.id}
+                                  className={`text-left text-[11px] px-2 py-1 rounded transition-colors truncate ${p.name === marker.player_name ? "bg-accent/20 text-accent" : "hover:bg-panel-border text-gray-300"}`}
+                                  onClick={async () => {
+                                    await DatabaseService.updatePlayEventAndPlayer(marker.id, null, p.id);
+                                    await PlayCoordinator.refreshPlaysFromDatabase();
+                                    setEditingMarkerId(null);
+                                    setEditMode(null);
+                                  }}
+                                >
+                                  #{p.number} {p.name}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 );
               })}
             </div>

@@ -487,26 +487,9 @@ export function Toolbar() {
   };
 
   const applyOptionalSelectedRoster = async () => {
-    const selectedRosterRaw = localStorage.getItem("sve.selectedRosterId");
-    if (!selectedRosterRaw) return;
-    const selectedRosterId = Number(selectedRosterRaw);
-    if (!Number.isFinite(selectedRosterId) || selectedRosterId <= 0) return;
-
-    const applyRoster = window.confirm(
-      "Apply the currently selected saved roster to this new project?",
-    );
-    if (!applyRoster) return;
-
-    const rosterPlayers = await DatabaseService.getRosterPlayers(selectedRosterId);
-    const projectPlayers = rosterPlayers.map((player, index) => ({
-      id: index + 1,
-      name: player.name,
-      number: player.number,
-    }));
-    await DatabaseService.savePlayersBulk(projectPlayers);
-    const freshPlayers = await DatabaseService.getPlayers();
-    setPlayers(freshPlayers);
-    resetOnCourtTracking();
+    // Clear the persisted roster selection on new project — roster is only
+    // applied on explicit user selection in the scoring panel dropdown.
+    localStorage.removeItem("sve.selectedRosterId");
   };
 
   const handleConfirmDestructiveAction = async () => {

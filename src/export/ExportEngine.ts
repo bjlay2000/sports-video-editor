@@ -27,7 +27,7 @@ import {
   type EncoderName,
   type ResolvedEncoder,
 } from "../services/HardwareDetection";
-import type { Overlay, Keyframe } from "../engine/types";
+import type { Overlay, Keyframe, ViewportState } from "../engine/types";
 
 /* ================================================================
  *  Export Logger — timestamped console log for every export step
@@ -70,6 +70,9 @@ export interface ExportConfig {
   outputPath: string;
   exportWidth: number;
   exportHeight: number;
+  sourceWidth: number;
+  sourceHeight: number;
+  viewport?: ViewportState;
   fps: number;
   qualityProfile?: QualityProfile;
   onProgress?: (percent: number, status: string) => void;
@@ -741,6 +744,9 @@ function buildFiltergraph(
   exportHeight: number,
   totalDuration: number,
   useQsvHardwareFilters: boolean,
+  viewport?: ViewportState,
+  sourceWidth?: number,
+  sourceHeight?: number,
 ): string {
   exportLog(
     `buildFiltergraph: ${clips.length} clips, ${overlays.length} overlays, ${exportWidth}x${exportHeight}, duration=${totalDuration.toFixed(2)}s qsvFilters=${useQsvHardwareFilters}`,
@@ -773,30 +779,20 @@ function buildFiltergraph(
     `[aconcat]atrim=duration=${totalDuration.toFixed(4)},asetpts=PTS-STARTPTS[aout]`,
   );
 
-  /* ---- 3. Scale [vbase] → [vscaled] (never scale after overlay) ---- */
-  exportLog(`buildFiltergraph: scaling to ${exportWidth}x${exportHeight}`);
-  const scaleOut = overlays.length > 0 ? "vscaled" : "vout";
-  if (useQsvHardwareFilters) {
-    filters.push(
-      `[vbase]scale_qsv=w=${exportWidth}:h=${exportHeight}:format=nv12[${scaleOut}]`,
-    );
-  } else {
-    filters.push(
-      `[vbase]scale=${exportWidth}:${exportHeight}:flags=lanczos[${scaleOut}]`,
-    );
-  }
-
-  /* ---- 4. Overlay chain starting from [vscaled] ---- */
+  /* ---- 3. Overlay chain at source resolution [vbase] → [vwith_overlays] ---- */
+  /* Overlays are composited at source resolution (their native coordinate space)
+     BEFORE any viewport crop or scale, so positions match the preview exactly. */
+  let overlayOutLabel = "vbase";
   if (overlays.length > 0) {
-    exportLog(`buildFiltergraph: building overlay chain (${overlays.length} overlays)`);
-    let prevLabel = "vscaled";
+    exportLog(`buildFiltergraph: building overlay chain (${overlays.length} overlays) at source resolution`);
+    let prevLabel = "vbase";
 
     for (let i = 0; i < overlays.length; i++) {
       const prep = overlays[i];
       const ov = prep.overlay;
       const inputIdx = i + 1; // [0] = source video, [1+] = overlay PNGs
       const isLast = i === overlays.length - 1;
-      const outLabel = isLast ? "vout" : `vtmp${i}`;
+      const outLabel = isLast ? "vwith_overlays" : `vtmp${i}`;
 
       /* -- Overlay input processing chain -- */
       const chain: string[] = [];
@@ -893,6 +889,35 @@ function buildFiltergraph(
 
       prevLabel = outLabel;
     }
+    overlayOutLabel = "vwith_overlays";
+  }
+
+  /* ---- 4. Viewport crop [overlayOut] → [vcropped] (after overlays, before scale) ---- */
+  let preScaleLabel = overlayOutLabel;
+  if (viewport && viewport.zoom > 1 && sourceWidth && sourceHeight) {
+    const cropW = Math.floor(sourceWidth / viewport.zoom);
+    const cropH = Math.floor(sourceHeight / viewport.zoom);
+    const maxX = Math.max(0, sourceWidth - cropW);
+    const maxY = Math.max(0, sourceHeight - cropH);
+    const cropX = Math.floor(Math.min(Math.max(0, viewport.panX), maxX));
+    const cropY = Math.floor(Math.min(Math.max(0, viewport.panY), maxY));
+    exportLog(`buildFiltergraph: viewport crop=${cropW}:${cropH}:${cropX}:${cropY} (zoom=${viewport.zoom})`);
+    filters.push(
+      `[${overlayOutLabel}]crop=${cropW}:${cropH}:${cropX}:${cropY}[vcropped]`,
+    );
+    preScaleLabel = "vcropped";
+  }
+
+  /* ---- 5. Scale → [vout] ---- */
+  exportLog(`buildFiltergraph: scaling to ${exportWidth}x${exportHeight}`);
+  if (useQsvHardwareFilters) {
+    filters.push(
+      `[${preScaleLabel}]scale_qsv=w=${exportWidth}:h=${exportHeight}:format=nv12[vout]`,
+    );
+  } else {
+    filters.push(
+      `[${preScaleLabel}]scale=${exportWidth}:${exportHeight}:flags=lanczos[vout]`,
+    );
   }
 
   return filters.join(";");
@@ -917,6 +942,9 @@ export async function runExport(config: ExportConfig): Promise<ExportResult> {
     outputPath,
     exportWidth,
     exportHeight,
+    sourceWidth,
+    sourceHeight,
+    viewport,
     fps,
     qualityProfile = "fast",
     onProgress,
@@ -976,6 +1004,9 @@ export async function runExport(config: ExportConfig): Promise<ExportResult> {
     exportHeight,
     totalDuration,
     useQsvHardwareFilters,
+    viewport,
+    sourceWidth,
+    sourceHeight,
   );
   exportLog(`runExport: filtergraph built in ${Date.now() - filtergraphStartedAt}ms`);
 

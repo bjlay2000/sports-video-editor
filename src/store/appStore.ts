@@ -92,6 +92,8 @@ interface AppState {
   initializeExportQualityForContext: (context: ExportQualityContext) => void;
   setExportEstimatedTime: (time: string | null) => void;
   bumpPlayedPercentRefresh: () => void;
+  gameResetVersion: number;
+  bumpGameResetVersion: () => void;
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -128,6 +130,7 @@ export const useAppStore = create<AppState>((set) => ({
   },
   exportEstimatedTime: null as string | null,
   playedPercentRefreshVersion: 0,
+  gameResetVersion: 0,
   setPlayers: (players) =>
     set((state) => {
       const validIds = new Set(players.map((p) => p.id));
@@ -355,5 +358,9 @@ export const useAppStore = create<AppState>((set) => ({
   bumpPlayedPercentRefresh: () =>
     set((state) => ({
       playedPercentRefreshVersion: state.playedPercentRefreshVersion + 1,
+    })),
+  bumpGameResetVersion: () =>
+    set((state) => ({
+      gameResetVersion: state.gameResetVersion + 1,
     })),
 }));
