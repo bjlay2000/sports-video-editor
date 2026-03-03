@@ -106,6 +106,13 @@ pub struct RosterPlayerInput {
     pub number: i32,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OpponentStat {
+    pub id: i64,
+    pub timestamp: f64,
+    pub event_type: String,
+}
+
 pub fn init_db(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "
@@ -166,7 +173,14 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_plays_timestamp ON plays(timestamp);
         CREATE INDEX IF NOT EXISTS idx_plays_player ON plays(player_id);
         CREATE INDEX IF NOT EXISTS idx_plays_event ON plays(event_type);
+        CREATE TABLE IF NOT EXISTS opponent_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            event_type TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_score_events_team ON score_events(team, time);
+        CREATE INDEX IF NOT EXISTS idx_opponent_stats_event ON opponent_stats(event_type);
         ",
     )
     .map_err(|e| format!("Failed to initialize database: {}", e))?;
@@ -405,7 +419,7 @@ mod chrono_like {
 mod commands {
     use super::{
         chrono_like_now, open_rosters_db, resolve_monitor_log_path, ClipRange,
-        DbState, Game, Play, Player, PlayerPlayedPercentage, PlayerShift,
+        DbState, Game, OpponentStat, Play, Player, PlayerPlayedPercentage, PlayerShift,
         Roster, RosterPlayer, RosterPlayerInput, ScoreEvent, StatRecordResult, TimelineClip,
     };
     use rusqlite::params;
@@ -1057,6 +1071,89 @@ mod commands {
             .filter_map(|r| r.ok())
             .collect();
         Ok(events)
+    }
+
+    // ── opponent stats (team-level, no FK dependency on players) ──
+
+    #[tauri::command]
+    pub fn save_opponent_stats(
+        state: State<DbState>,
+        stats: Vec<OpponentStat>,
+    ) -> Result<(), String> {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        let result = (|| -> Result<(), String> {
+            conn.execute("DELETE FROM opponent_stats", [])
+                .map_err(|e| e.to_string())?;
+            let mut stmt = conn
+                .prepare(
+                    "INSERT INTO opponent_stats (timestamp, event_type) VALUES (?1, ?2)",
+                )
+                .map_err(|e| e.to_string())?;
+            for s in &stats {
+                stmt.execute(params![s.timestamp, s.event_type])
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })();
+        if result.is_ok() {
+            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        } else {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        result
+    }
+
+    #[tauri::command]
+    pub fn get_opponent_stats(state: State<DbState>) -> Result<Vec<OpponentStat>, String> {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
+        let mut stmt = conn
+            .prepare("SELECT id, timestamp, event_type FROM opponent_stats ORDER BY timestamp")
+            .map_err(|e| e.to_string())?;
+        let stats = stmt
+            .query_map([], |row| {
+                Ok(OpponentStat {
+                    id: row.get(0)?,
+                    timestamp: row.get(1)?,
+                    event_type: row.get(2)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(stats)
+    }
+
+    #[tauri::command]
+    pub fn add_opponent_stat(
+        state: State<DbState>,
+        timestamp: f64,
+        event_type: String,
+    ) -> Result<OpponentStat, String> {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
+        conn.execute(
+            "INSERT INTO opponent_stats (timestamp, event_type) VALUES (?1, ?2)",
+            params![timestamp, event_type],
+        )
+        .map_err(|e| e.to_string())?;
+        let id = conn.last_insert_rowid();
+        Ok(OpponentStat {
+            id,
+            timestamp,
+            event_type,
+        })
+    }
+
+    #[tauri::command]
+    pub fn delete_opponent_stat(state: State<DbState>, id: i64) -> Result<(), String> {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let conn = guard.as_ref().ok_or("No project database is open")?;
+        conn.execute("DELETE FROM opponent_stats WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     #[tauri::command]
@@ -1759,6 +1856,10 @@ fn main() {
             commands::get_player_shifts,
             commands::save_score_events,
             commands::get_score_events,
+            commands::save_opponent_stats,
+            commands::get_opponent_stats,
+            commands::add_opponent_stat,
+            commands::delete_opponent_stat,
             commands::save_players_bulk,
             commands::save_plays_bulk,
             commands::ensure_exports_dir,

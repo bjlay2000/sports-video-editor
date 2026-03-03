@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { Player, Play, Game, TimelineMarker, ScoreAdjustmentEvent, OnCourtInterval } from "./types";
+import { Player, Play, Game, TimelineMarker, ScoreAdjustmentEvent, OnCourtInterval, OpponentPlay } from "./types";
 import {
   defaultQualityForContext,
   type ExportQualityContext,
@@ -32,6 +32,7 @@ interface AppState {
   onCourtIntervals: OnCourtInterval[];
   opponentScoreEvents: ScoreAdjustmentEvent[];
   homeScoreEvents: ScoreAdjustmentEvent[];
+  opponentPlays: OpponentPlay[];
   projectSavedSignature: string | null;
   pendingStat: string | null;
   pendingStatTimestamp: number | null;
@@ -76,6 +77,9 @@ interface AppState {
   logHomeScoreEvent: (score: number, time: number) => void;
   resetOpponentScoreEvents: (initialScore?: number) => void;
   resetHomeScoreEvents: (initialScore?: number) => void;
+  setOpponentPlays: (plays: OpponentPlay[]) => void;
+  addOpponentPlay: (play: OpponentPlay) => void;
+  removeOpponentPlay: (id: number) => void;
   setProjectSavedSignature: (signature: string | null) => void;
   setPendingStat: (stat: string | null, timestamp?: number | null) => void;
   setShowPlayerModal: (show: boolean) => void;
@@ -105,6 +109,7 @@ export const useAppStore = create<AppState>((set) => ({
   onCourtIntervals: [],
   opponentScoreEvents: [{ time: 0, score: 0 }],
   homeScoreEvents: [{ time: 0, score: 0 }],
+  opponentPlays: [],
   projectSavedSignature: null,
   pendingStat: null,
   pendingStatTimestamp: null,
@@ -276,6 +281,11 @@ export const useAppStore = create<AppState>((set) => ({
     set({ opponentScoreEvents: [{ time: 0, score: initialScore }] }),
   resetHomeScoreEvents: (initialScore = 0) =>
     set({ homeScoreEvents: [{ time: 0, score: initialScore }] }),
+  setOpponentPlays: (plays) => set({ opponentPlays: plays }),
+  addOpponentPlay: (play) =>
+    set((state) => ({ opponentPlays: [...state.opponentPlays, play] })),
+  removeOpponentPlay: (id) =>
+    set((state) => ({ opponentPlays: state.opponentPlays.filter((p) => p.id !== id) })),
   setProjectSavedSignature: (signature) => set({ projectSavedSignature: signature }),
   setPendingStat: (stat, timestamp = null) =>
     set({ pendingStat: stat, pendingStatTimestamp: timestamp ?? null }),

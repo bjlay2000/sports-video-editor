@@ -51,6 +51,12 @@ export type StatType =
   | "TO"
   | "FOUL";
 
+export interface OpponentPlay {
+  id: number;
+  timestamp: number;
+  event_type: string;
+}
+
 export interface ClipRange {
   start_time: number;
   end_time: number;

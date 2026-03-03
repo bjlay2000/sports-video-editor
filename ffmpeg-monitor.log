@@ -1,36 +1,37 @@
-=== monitor started 2026-03-02T21:57:18.028Z (reset on app launch) ===
-[2026-03-02T21:57:35.961Z (16:57:35.961)] [HardwareDetection] running ffmpeg -encoders
-[2026-03-02T21:57:35.963Z (16:57:35.963)] [FfmpegService] runFfmpeg: called args=[-hide_banner -encoders] onProgress=false stallTimeoutMs=90000
-[2026-03-02T21:57:35.963Z (16:57:35.963)] [FfmpegService] runFfmpeg: using execute path
-[2026-03-02T21:57:36.180Z (16:57:36.180)] [FfmpegService] runFfmpeg: execute path completed code=0
-[2026-03-02T21:57:36.180Z (16:57:36.180)] [HardwareDetection] ffmpeg -encoders output length=14534
-[2026-03-02T21:57:36.181Z (16:57:36.181)] [HardwareDetection] compiled-in: av1_nvenc
-[2026-03-02T21:57:36.181Z (16:57:36.181)] [HardwareDetection] compiled-in: hevc_nvenc
-[2026-03-02T21:57:36.182Z (16:57:36.182)] [HardwareDetection] compiled-in: h264_nvenc
-[2026-03-02T21:57:36.182Z (16:57:36.182)] [HardwareDetection] compiled-in: av1_qsv
-[2026-03-02T21:57:36.182Z (16:57:36.182)] [HardwareDetection] compiled-in: hevc_qsv
-[2026-03-02T21:57:36.183Z (16:57:36.183)] [HardwareDetection] compiled-in: h264_qsv
-[2026-03-02T21:57:36.183Z (16:57:36.183)] [HardwareDetection] compiled-in: hevc_amf
-[2026-03-02T21:57:36.183Z (16:57:36.183)] [HardwareDetection] compiled-in: h264_amf
-[2026-03-02T21:57:36.184Z (16:57:36.184)] [HardwareDetection] compiled-in: libx264
-[2026-03-02T21:57:36.184Z (16:57:36.184)] [HardwareDetection] compiled-in: libx265
-[2026-03-02T21:57:36.184Z (16:57:36.184)] [HardwareDetection] probing h264_nvenc...
-[2026-03-02T21:57:36.185Z (16:57:36.185)] [FfmpegService] runFfmpeg: called args=[-hide_banner -loglevel error -f lavfi -i nullsrc=s=64x64:d=0.04 -frames:v 1 -c:v h264_nvenc -f null -] onProgress=false stallTimeoutMs=90000
-[2026-03-02T21:57:36.185Z (16:57:36.185)] [FfmpegService] runFfmpeg: using execute path
-[2026-03-02T21:57:36.377Z (16:57:36.377)] [FfmpegService] runFfmpeg: execute path failed code=-1
-[2026-03-02T21:57:36.378Z (16:57:36.378)] [HardwareDetection] probe h264_nvenc: FAILED (no hardware)
-[2026-03-02T21:57:36.378Z (16:57:36.378)] [HardwareDetection] nvidia: hardware NOT present (h264_nvenc probe failed)
-[2026-03-02T21:57:36.378Z (16:57:36.378)] [HardwareDetection] probing h264_qsv...
-[2026-03-02T21:57:36.378Z (16:57:36.378)] [FfmpegService] runFfmpeg: called args=[-hide_banner -loglevel error -f lavfi -i nullsrc=s=64x64:d=0.04 -frames:v 1 -c:v h264_qsv -f null -] onProgress=false stallTimeoutMs=90000
-[2026-03-02T21:57:36.379Z (16:57:36.379)] [FfmpegService] runFfmpeg: using execute path
-[2026-03-02T21:57:44.025Z (16:57:44.025)] [FfmpegService] runFfmpeg: execute path completed code=0
-[2026-03-02T21:57:44.025Z (16:57:44.025)] [HardwareDetection] probe h264_qsv: OK
-[2026-03-02T21:57:44.026Z (16:57:44.026)] [HardwareDetection] intel: hardware VERIFIED via h264_qsv
-[2026-03-02T21:57:44.026Z (16:57:44.026)] [HardwareDetection] probing h264_amf...
-[2026-03-02T21:57:44.026Z (16:57:44.026)] [FfmpegService] runFfmpeg: called args=[-hide_banner -loglevel error -f lavfi -i nullsrc=s=64x64:d=0.04 -frames:v 1 -c:v h264_amf -f null -] onProgress=false stallTimeoutMs=90000
-[2026-03-02T21:57:44.026Z (16:57:44.026)] [FfmpegService] runFfmpeg: using execute path
-[2026-03-02T21:57:44.191Z (16:57:44.191)] [FfmpegService] runFfmpeg: execute path failed code=-1313558101
-[2026-03-02T21:57:44.192Z (16:57:44.192)] [HardwareDetection] probe h264_amf: FAILED (no hardware)
-[2026-03-02T21:57:44.192Z (16:57:44.192)] [HardwareDetection] amd: hardware NOT present (h264_amf probe failed)
-[2026-03-02T21:57:44.192Z (16:57:44.192)] [HardwareDetection] verified vendor=intel hw=[av1_qsv,hevc_qsv,h264_qsv] sw=[libx264,libx265]
-[2026-03-02T21:57:44.192Z (16:57:44.192)] [HardwareDetection] priority chain: [av1_qsv → hevc_qsv → h264_qsv → libx265 → libx264]
+=== monitor started 2026-03-03T18:52:28.356Z (reset on app launch) ===
+[2026-03-03T18:52:47.270Z (13:52:47.270)] [FfmpegService] createCancelToken
+[2026-03-03T18:52:47.283Z (13:52:47.283)] [HardwareDetection] running ffmpeg -encoders
+[2026-03-03T18:52:47.284Z (13:52:47.284)] [FfmpegService] runFfmpeg: called args=[-hide_banner -encoders] onProgress=false stallTimeoutMs=90000
+[2026-03-03T18:52:47.284Z (13:52:47.284)] [FfmpegService] runFfmpeg: using execute path
+[2026-03-03T18:52:49.505Z (13:52:49.505)] [FfmpegService] runFfmpeg: execute path completed code=0
+[2026-03-03T18:52:49.505Z (13:52:49.505)] [HardwareDetection] ffmpeg -encoders output length=14534
+[2026-03-03T18:52:49.505Z (13:52:49.505)] [HardwareDetection] compiled-in: av1_nvenc
+[2026-03-03T18:52:49.505Z (13:52:49.505)] [HardwareDetection] compiled-in: hevc_nvenc
+[2026-03-03T18:52:49.506Z (13:52:49.506)] [HardwareDetection] compiled-in: h264_nvenc
+[2026-03-03T18:52:49.506Z (13:52:49.506)] [HardwareDetection] compiled-in: av1_qsv
+[2026-03-03T18:52:49.506Z (13:52:49.506)] [HardwareDetection] compiled-in: hevc_qsv
+[2026-03-03T18:52:49.506Z (13:52:49.506)] [HardwareDetection] compiled-in: h264_qsv
+[2026-03-03T18:52:49.506Z (13:52:49.506)] [HardwareDetection] compiled-in: hevc_amf
+[2026-03-03T18:52:49.506Z (13:52:49.506)] [HardwareDetection] compiled-in: h264_amf
+[2026-03-03T18:52:49.507Z (13:52:49.507)] [HardwareDetection] compiled-in: libx264
+[2026-03-03T18:52:49.507Z (13:52:49.507)] [HardwareDetection] compiled-in: libx265
+[2026-03-03T18:52:49.507Z (13:52:49.507)] [HardwareDetection] probing h264_nvenc...
+[2026-03-03T18:52:49.507Z (13:52:49.507)] [FfmpegService] runFfmpeg: called args=[-hide_banner -loglevel error -f lavfi -i nullsrc=s=64x64:d=0.04 -frames:v 1 -c:v h264_nvenc -f null -] onProgress=false stallTimeoutMs=90000
+[2026-03-03T18:52:49.507Z (13:52:49.507)] [FfmpegService] runFfmpeg: using execute path
+[2026-03-03T18:52:50.848Z (13:52:50.848)] [FfmpegService] runFfmpeg: execute path failed code=-1
+[2026-03-03T18:52:50.848Z (13:52:50.848)] [HardwareDetection] probe h264_nvenc: FAILED (no hardware)
+[2026-03-03T18:52:50.848Z (13:52:50.848)] [HardwareDetection] nvidia: hardware NOT present (h264_nvenc probe failed)
+[2026-03-03T18:52:50.848Z (13:52:50.848)] [HardwareDetection] probing h264_qsv...
+[2026-03-03T18:52:50.848Z (13:52:50.848)] [FfmpegService] runFfmpeg: called args=[-hide_banner -loglevel error -f lavfi -i nullsrc=s=64x64:d=0.04 -frames:v 1 -c:v h264_qsv -f null -] onProgress=false stallTimeoutMs=90000
+[2026-03-03T18:52:50.849Z (13:52:50.849)] [FfmpegService] runFfmpeg: using execute path
+[2026-03-03T18:52:54.985Z (13:52:54.985)] [FfmpegService] runFfmpeg: execute path completed code=0
+[2026-03-03T18:52:54.985Z (13:52:54.985)] [HardwareDetection] probe h264_qsv: OK
+[2026-03-03T18:52:54.986Z (13:52:54.986)] [HardwareDetection] intel: hardware VERIFIED via h264_qsv
+[2026-03-03T18:52:54.986Z (13:52:54.986)] [HardwareDetection] probing h264_amf...
+[2026-03-03T18:52:54.986Z (13:52:54.986)] [FfmpegService] runFfmpeg: called args=[-hide_banner -loglevel error -f lavfi -i nullsrc=s=64x64:d=0.04 -frames:v 1 -c:v h264_amf -f null -] onProgress=false stallTimeoutMs=90000
+[2026-03-03T18:52:54.986Z (13:52:54.986)] [FfmpegService] runFfmpeg: using execute path
+[2026-03-03T18:52:55.096Z (13:52:55.096)] [FfmpegService] runFfmpeg: execute path failed code=-1313558101
+[2026-03-03T18:52:55.096Z (13:52:55.096)] [HardwareDetection] probe h264_amf: FAILED (no hardware)
+[2026-03-03T18:52:55.097Z (13:52:55.097)] [HardwareDetection] amd: hardware NOT present (h264_amf probe failed)
+[2026-03-03T18:52:55.097Z (13:52:55.097)] [HardwareDetection] verified vendor=intel hw=[av1_qsv,hevc_qsv,h264_qsv] sw=[libx264,libx265]
+[2026-03-03T18:52:55.097Z (13:52:55.097)] [HardwareDetection] priority chain: [av1_qsv → hevc_qsv → h264_qsv → libx265 → libx264]

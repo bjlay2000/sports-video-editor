@@ -10,14 +10,24 @@ const SCORING_STATS = ["2PT", "3PT", "FT"];
 const ASSIST_PROMPT_STATS: StatType[] = ["2PT", "3PT"];
 const REBOUND_PROMPT_STATS: StatType[] = ["2PT_MISS", "3PT_MISS", "FT_MISS", "BLK"];
 
-type SelectionStep = "primary" | "assist" | "rebound";
+type SelectionStep =
+  | "primary"
+  | "assist"
+  | "rebound"
+  | "opponentAssistChoice"
+  | "blockShotType"
+  | "blockMissShooter";
+type PossessionSide = "home" | "opponent";
+type BlockShotType = "2PT" | "3PT";
 
 interface FollowUpContext {
   captureTime: number;
   startTime: number;
   endTime: number;
   needsRebound: boolean;
-  primaryPlayerId: number;
+  side: PossessionSide;
+  primaryPlayerId: number | null;
+  blockMissType?: StatType;
 }
 
 const describeStat = (stat: string | null) => {
@@ -45,12 +55,24 @@ export function PlayerSelectModal() {
   const addMarker = useAppStore((s) => s.addMarker);
   const game = useAppStore((s) => s.game);
   const setGame = useAppStore((s) => s.setGame);
+  const addOpponentPlay = useAppStore((s) => s.addOpponentPlay);
+  const logOpponentScoreEvent = useAppStore((s) => s.logOpponentScoreEvent);
   const currentTime = useVideoStore((s) => s.currentTime);
+  const logHomeScoreEvent = useAppStore((s) => s.logHomeScoreEvent);
   const pushToast = useToastStore((s) => s.pushToast);
   const [step, setStep] = useState<SelectionStep>("primary");
   const [followUpContext, setFollowUpContext] = useState<FollowUpContext | null>(null);
   const [modalLeft, setModalLeft] = useState<number | null>(null);
   const modalRef = useRef<HTMLDivElement>(null);
+
+  const getScoreDelta = (stat: string) =>
+    stat === "3PT" ? 3 : stat === "2PT" ? 2 : stat === "FT" ? 1 : 0;
+
+  const addOpponentStat = async (eventType: string, captureTime: number) => {
+    await ProjectService.ensureProjectDbOpen();
+    const result = await DatabaseService.addOpponentStat(captureTime, eventType);
+    addOpponentPlay({ id: result.id, timestamp: result.timestamp, event_type: result.event_type });
+  };
 
   useLayoutEffect(() => {
     const updatePosition = () => {
@@ -113,7 +135,7 @@ export function PlayerSelectModal() {
   );
 
   const selectablePlayers = useMemo(() => {
-    if (step !== "assist" || !followUpContext) {
+    if (step !== "assist" || !followUpContext || followUpContext.primaryPlayerId == null) {
       return sortedPlayers;
     }
     return sortedPlayers.filter((player) => player.id !== followUpContext.primaryPlayerId);
@@ -163,6 +185,9 @@ export function PlayerSelectModal() {
       label: result.play.event_type,
     });
     setGame(result.game);
+    if (scoreDelta != null && scoreDelta > 0) {
+      logHomeScoreEvent(result.game.home_score, captureTime);
+    }
     bumpPlayedPercentRefresh();
 
     return result.play;
@@ -182,7 +207,7 @@ export function PlayerSelectModal() {
 
     try {
       const scoreDelta = SCORING_STATS.includes(pendingStat)
-        ? (pendingStat === "3PT" ? 3 : pendingStat === "2PT" ? 2 : 1)
+        ? getScoreDelta(pendingStat)
         : null;
 
       await persistPlay(playerId, pendingStat as StatType, captureTime, startTime, endTime, scoreDelta);
@@ -190,13 +215,88 @@ export function PlayerSelectModal() {
       const needsAssist = ASSIST_PROMPT_STATS.includes(pendingStat as StatType);
       const needsRebound = REBOUND_PROMPT_STATS.includes(pendingStat as StatType);
 
+      if (pendingStat === "BLK") {
+        setFollowUpContext({
+          captureTime,
+          startTime,
+          endTime,
+          needsRebound,
+          side: "home",
+          primaryPlayerId: playerId,
+        });
+        setStep("blockShotType");
+        return;
+      }
+
       if (needsAssist || needsRebound) {
-        setFollowUpContext({ captureTime, startTime, endTime, needsRebound, primaryPlayerId: playerId });
+        setFollowUpContext({
+          captureTime,
+          startTime,
+          endTime,
+          needsRebound,
+          side: "home",
+          primaryPlayerId: playerId,
+        });
         setStep(needsAssist ? "assist" : "rebound");
         return;
       }
     } catch (e) {
       console.error("Failed to add play:", e);
+    }
+
+    closeModal();
+  };
+
+  const handleOpponentSelect = async () => {
+    if (!pendingStat) return;
+
+    const { captureTime, startTime, endTime } = captureDefaults;
+
+    try {
+      await addOpponentStat(pendingStat, captureTime);
+
+      // For scoring stats, adjust away score
+      const scoreDelta = SCORING_STATS.includes(pendingStat)
+        ? getScoreDelta(pendingStat)
+        : 0;
+      if (scoreDelta > 0) {
+        const nextAway = game.away_score + scoreDelta;
+        const updated = await DatabaseService.updateScore(game.home_score, nextAway);
+        setGame(updated);
+        logOpponentScoreEvent(nextAway, captureTime);
+      }
+
+      const needsAssist = ASSIST_PROMPT_STATS.includes(pendingStat as StatType);
+      const needsRebound = REBOUND_PROMPT_STATS.includes(pendingStat as StatType);
+
+      if (pendingStat === "BLK") {
+        setFollowUpContext({
+          captureTime,
+          startTime,
+          endTime,
+          needsRebound,
+          side: "opponent",
+          primaryPlayerId: null,
+        });
+        setStep("blockShotType");
+        return;
+      }
+
+      if (needsAssist || needsRebound) {
+        setFollowUpContext({
+          captureTime,
+          startTime,
+          endTime,
+          needsRebound,
+          side: "opponent",
+          primaryPlayerId: null,
+        });
+        setStep(needsAssist ? "opponentAssistChoice" : "rebound");
+        return;
+      }
+    } catch (e) {
+      console.error("Failed to add opponent stat:", e);
+      pushToast("Failed to record opponent stat", "error");
     }
 
     closeModal();
@@ -231,6 +331,84 @@ export function PlayerSelectModal() {
     closeModal();
   };
 
+  const handleOpponentAssistChoice = async (withAssist: boolean) => {
+    if (!followUpContext) {
+      closeModal();
+      return;
+    }
+    try {
+      if (withAssist) {
+        await addOpponentStat("AST", followUpContext.captureTime);
+      }
+    } catch (e) {
+      console.error("Failed to add opponent assist:", e);
+      pushToast("Failed to record opponent assist", "error");
+      closeModal();
+      return;
+    }
+
+    if (followUpContext.needsRebound) {
+      setStep("rebound");
+      return;
+    }
+    closeModal();
+  };
+
+  const handleBlockShotTypeSelect = async (shotType: BlockShotType) => {
+    if (!followUpContext) {
+      closeModal();
+      return;
+    }
+    try {
+      const missType: StatType = shotType === "3PT" ? "3PT_MISS" : "2PT_MISS";
+      if (followUpContext.side === "home") {
+        await addOpponentStat(missType, followUpContext.captureTime);
+      } else {
+        setFollowUpContext({ ...followUpContext, blockMissType: missType });
+        setStep("blockMissShooter");
+        return;
+      }
+    } catch (e) {
+      console.error("Failed to record blocked shot miss:", e);
+      pushToast("Failed to record blocked shot", "error");
+      closeModal();
+      return;
+    }
+
+    if (followUpContext.needsRebound) {
+      setStep("rebound");
+      return;
+    }
+    closeModal();
+  };
+
+  const handleBlockMissShooterSelect = async (playerId: number) => {
+    if (!followUpContext?.blockMissType) {
+      closeModal();
+      return;
+    }
+    try {
+      await persistPlay(
+        playerId,
+        followUpContext.blockMissType,
+        followUpContext.captureTime,
+        followUpContext.startTime,
+        followUpContext.endTime,
+      );
+    } catch (e) {
+      console.error("Failed to add blocked shot miss:", e);
+      pushToast("Failed to record blocked shot miss", "error");
+      closeModal();
+      return;
+    }
+
+    if (followUpContext.needsRebound) {
+      setStep("rebound");
+      return;
+    }
+    closeModal();
+  };
+
   const handleReboundSelect = async (playerId: number) => {
     if (!followUpContext) return;
     try {
@@ -247,6 +425,20 @@ export function PlayerSelectModal() {
     closeModal();
   };
 
+  const handleOpponentRebound = async () => {
+    if (!followUpContext) {
+      closeModal();
+      return;
+    }
+    try {
+      await addOpponentStat("REB", followUpContext.captureTime);
+    } catch (e) {
+      console.error("Failed to add opponent rebound:", e);
+      pushToast("Failed to record opponent rebound", "error");
+    }
+    closeModal();
+  };
+
   const handleClose = () => {
     closeModal();
   };
@@ -256,13 +448,21 @@ export function PlayerSelectModal() {
       ? <><span className="text-gray-400">Select Player — </span><span className="text-accent">{describeStat(pendingStat)}</span></>
       : step === "assist"
         ? <>Select <span className="text-blue-400 font-bold">Assist</span> Player</>
-        : <>Select <span className="text-yellow-400 font-bold">Rebound</span> Player</>;
+        : step === "opponentAssistChoice"
+          ? <>Opponent <span className="text-blue-400 font-bold">Assist</span>?</>
+          : step === "blockShotType"
+            ? <>Blocked Shot Type</>
+            : step === "blockMissShooter"
+              ? <>Select <span className="text-gray-300 font-bold">Missed Shot</span> Player</>
+            : <>Select <span className="text-yellow-400 font-bold">Rebound</span> Player</>;
 
   const onSelect =
     step === "primary"
       ? handlePrimarySelect
       : step === "assist"
         ? handleAssistSelect
+      : step === "blockMissShooter"
+        ? handleBlockMissShooterSelect
         : handleReboundSelect;
 
   return (
@@ -298,26 +498,79 @@ export function PlayerSelectModal() {
           </div>
         )}
 
-        {step === "rebound" && (
-          <div className="mb-3 flex items-center justify-end gap-2">
+        {step === "opponentAssistChoice" && (
+          <div className="mb-3 grid grid-cols-2 gap-2">
             <button
               type="button"
-              onClick={handleClose}
+              onClick={() => {
+                void handleOpponentAssistChoice(false);
+              }}
               className="px-2 py-1 text-[11px] bg-panel border border-panel-border rounded hover:bg-panel-border transition-colors"
             >
-              No Rebound
+              No Assist
             </button>
             <button
               type="button"
-              onClick={handleClose}
+              onClick={() => {
+                void handleOpponentAssistChoice(true);
+              }}
               className="px-2 py-1 text-[11px] bg-panel border border-panel-border rounded hover:bg-panel-border transition-colors"
             >
-              Opponent
+              Assist
             </button>
           </div>
         )}
 
+        {step === "blockShotType" && (
+          <div className="mb-3 grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                void handleBlockShotTypeSelect("2PT");
+              }}
+              className="px-2 py-1 text-[11px] bg-panel border border-panel-border rounded hover:bg-panel-border transition-colors"
+            >
+              2PT Shot
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                void handleBlockShotTypeSelect("3PT");
+              }}
+              className="px-2 py-1 text-[11px] bg-panel border border-panel-border rounded hover:bg-panel-border transition-colors"
+            >
+              3PT Shot
+            </button>
+          </div>
+        )}
+
+        {step === "rebound" && (
+          <div className="mb-3">
+            <button
+              type="button"
+              onClick={() => {
+                void handleOpponentRebound();
+              }}
+              className="w-full text-left px-3 py-2 bg-red-900/40 hover:bg-red-800/50 border border-red-700/40 rounded transition-colors flex items-center gap-3"
+            >
+              <span className="text-red-400 font-bold text-sm">OPP</span>
+              <span className="text-red-300 text-sm flex-1">Opponent</span>
+            </button>
+          </div>
+        )}
+
+        {step !== "opponentAssistChoice" && step !== "blockShotType" && (
         <div className="space-y-2">
+          {step === "primary" && (
+            <button
+              type="button"
+              onClick={handleOpponentSelect}
+              className="w-full text-left px-3 py-2 bg-red-900/40 hover:bg-red-800/50 border border-red-700/40 rounded transition-colors flex items-center gap-3"
+            >
+              <span className="text-red-400 font-bold text-sm">OPP</span>
+              <span className="text-red-300 text-sm flex-1">Opponent</span>
+            </button>
+          )}
           <div className="text-[10px] uppercase tracking-wider text-gray-500">On Court</div>
           <div className="space-y-1.5">
             {playersOnCourt.map((player) => (
@@ -379,6 +632,7 @@ export function PlayerSelectModal() {
             <p className="text-xs text-gray-500">No eligible players available.</p>
           )}
         </div>
+        )}
       </div>
     </div>
   );

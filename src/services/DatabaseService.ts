@@ -50,6 +50,12 @@ export interface RosterPlayer {
   number: number;
 }
 
+export interface DbOpponentStat {
+  id: number;
+  timestamp: number;
+  event_type: string;
+}
+
 export class DatabaseService {
   /* ── project DB lifecycle ── */
 
@@ -171,6 +177,25 @@ export class DatabaseService {
 
   static async getScoreEvents(): Promise<DbScoreEvent[]> {
     return invoke<DbScoreEvent[]>("get_score_events");
+  }
+
+  /* ── opponent stats ── */
+
+  static async saveOpponentStats(stats: Array<{ timestamp: number; event_type: string }>): Promise<void> {
+    const mapped = stats.map((s) => ({ id: 0, ...s }));
+    return invoke<void>("save_opponent_stats", { stats: mapped });
+  }
+
+  static async getOpponentStats(): Promise<DbOpponentStat[]> {
+    return invoke<DbOpponentStat[]>("get_opponent_stats");
+  }
+
+  static async addOpponentStat(timestamp: number, eventType: string): Promise<DbOpponentStat> {
+    return invoke<DbOpponentStat>("add_opponent_stat", { timestamp, eventType });
+  }
+
+  static async deleteOpponentStat(id: number): Promise<void> {
+    return invoke<void>("delete_opponent_stat", { id });
   }
 
   /* ── crash safety ── */

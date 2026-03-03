@@ -181,19 +181,21 @@
         state.timeline_clips.length + ' clips \u00B7 ' +
         state.player_shifts.length + ' shifts \u00B7 ' +
         state.plays.length + ' plays \u00B7 ' +
-        state.score_events.length + ' scores';
+        state.score_events.length + ' scores \u00B7 ' +
+        (state.opponent_stats || []).length + ' opp stats';
     }
 
     async function fetchAndRender() {
       if (!invoke) return;
       try {
-        const [players, playerShifts, plays, scoreEvents, timelineClips] =
+        const [players, playerShifts, plays, scoreEvents, timelineClips, opponentStats] =
           await Promise.all([
             invoke('get_players'),
             invoke('get_player_shifts'),
             invoke('get_plays'),
             invoke('get_score_events'),
             invoke('get_timeline_clips'),
+            invoke('get_opponent_stats').catch(function() { return []; }),
           ]);
 
         const onCourtIds = [
@@ -212,6 +214,7 @@
           plays,
           score_events: scoreEvents,
           timeline_clips: timelineClips,
+          opponent_stats: opponentStats,
           on_court_players: onCourtIds,
           warnings,
         };
@@ -451,6 +454,20 @@
             '<td>' + escapeHtml(e.team) + '</td>' +
             '<td>' + fmtTime(e.time) + '</td>' +
             '<td>' + e.score + '</td>' +
+          '</tr>';
+        }
+        return t + '</tbody></table>';
+      });
+
+      var oppStats = state.opponent_stats || [];
+      html += renderSection('oppstats', 'Opponent Stats', oppStats.length, function() {
+        if (!oppStats.length) return '<div class="empty">No opponent stats</div>';
+        var t = '<table><thead><tr><th>ID</th><th>Type</th><th>Time</th></tr></thead><tbody>';
+        for (const s of oppStats) {
+          t += '<tr>' +
+            '<td>' + s.id + '</td>' +
+            '<td>' + escapeHtml(s.event_type) + '</td>' +
+            '<td>' + fmtTime(s.timestamp) + '</td>' +
           '</tr>';
         }
         return t + '</tbody></table>';

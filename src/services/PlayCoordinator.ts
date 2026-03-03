@@ -136,6 +136,7 @@ export class PlayCoordinator {
     store.resetOpponentScoreEvents(0);
     store.resetOnCourtTracking();
     store.setPlayers([]);
+    store.setOpponentPlays([]);
     store.bumpGameResetVersion();
     const timeline = useTimelineStore.getState();
     timeline.setSelectedMarkerIds([]);

@@ -169,6 +169,11 @@ async function persistMutableDataToDb(): Promise<void> {
 
   // game score
   await DatabaseService.updateScore(app.game.home_score, app.game.away_score);
+
+  // opponent stats (no FK dependencies)
+  await DatabaseService.saveOpponentStats(
+    app.opponentPlays.map((p) => ({ timestamp: p.timestamp, event_type: p.event_type })),
+  );
 }
 
 async function loadMutableDataFromDb(currentTimelinePosition: number) {
@@ -216,6 +221,9 @@ async function loadMutableDataFromDb(currentTimelinePosition: number) {
     .filter((e) => e.team === "away")
     .map((e) => ({ time: e.time, score: e.score }));
 
+  // opponent stats
+  const opponentPlays = await DatabaseService.getOpponentStats().catch(() => []);
+
   // markers from plays
   const statMarkers: TimelineMarker[] = plays.map((play) => ({
     id: play.id,
@@ -237,6 +245,7 @@ async function loadMutableDataFromDb(currentTimelinePosition: number) {
     onCourtPlayerIds,
     homeScoreEvents: homeScoreEvents.length ? homeScoreEvents : [{ time: 0, score: 0 }],
     opponentScoreEvents: opponentScoreEvents.length ? opponentScoreEvents : [{ time: 0, score: 0 }],
+    opponentPlays: opponentPlays.map((p) => ({ id: p.id, timestamp: p.timestamp, event_type: p.event_type })),
     markers: statMarkers,
   };
 }
@@ -459,6 +468,7 @@ export class ProjectService {
       onCourtIntervals: dbData.onCourtIntervals,
       opponentScoreEvents: dbData.opponentScoreEvents,
       homeScoreEvents: dbData.homeScoreEvents,
+      opponentPlays: dbData.opponentPlays,
       pendingStat: null,
       pendingStatTimestamp: null,
       showPlayerModal: false,

@@ -109,6 +109,7 @@ function csvEscape(value: string | number | null | undefined): string {
 export function ScoringPanel() {
   const game = useAppStore((s) => s.game);
   const plays = useAppStore((s) => s.plays);
+  const opponentPlays = useAppStore((s) => s.opponentPlays);
   const players = useAppStore((s) => s.players);
   const setPlayers = useAppStore((s) => s.setPlayers);
   const resetOnCourtTracking = useAppStore((s) => s.resetOnCourtTracking);
@@ -366,6 +367,33 @@ export function ScoringPanel() {
     };
   }, [players, plays, playedPercentages]);
 
+  const opponentTotals = useMemo(() => {
+    const shots = createEmptyShotTotals();
+    const others = createEmptyOtherTotals();
+    opponentPlays.forEach((play) => {
+      const shotMatch = SHOT_TYPES.find(
+        (shot) => play.event_type === shot.makeType || play.event_type === shot.missType
+      );
+      if (shotMatch) {
+        if (play.event_type === shotMatch.makeType) {
+          shots[shotMatch.key].makes += 1;
+        } else {
+          shots[shotMatch.key].misses += 1;
+        }
+        return;
+      }
+      const statKey = play.event_type as StatType;
+      if ((OTHER_STATS as readonly StatType[]).includes(statKey)) {
+        others[statKey as OtherStat] += 1;
+      }
+    });
+    const points = SHOT_TYPES.reduce(
+      (sum, shot) => sum + shots[shot.key].makes * shot.points,
+      0
+    );
+    return { shots, others, points };
+  }, [opponentPlays]);
+
   const handleExportStatsCsv = useCallback(async () => {
     if (statRows.length === 0) return;
 
@@ -575,12 +603,89 @@ export function ScoringPanel() {
                 </tfoot>
               </table>
             )}
+
+            {/* Box Score — Home vs Opponent comparison */}
+            {(statRows.length > 0 || opponentPlays.length > 0) && (
+              <div className="mt-4 pt-3 border-t border-panel-border">
+                <h5 className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-2">
+                  Box Score
+                </h5>
+                <table className="w-full text-[11px] text-gray-200">
+                  <thead>
+                    <tr className="text-[10px] uppercase tracking-wider text-gray-500">
+                      <th className="text-left font-semibold py-1">Team</th>
+                      <th className="text-right font-semibold py-1">PTS</th>
+                      {SHOT_TYPES.map((shot) => (
+                        <th key={shot.key} className="text-right font-semibold py-1 px-1">
+                          {shot.label}
+                        </th>
+                      ))}
+                      {OTHER_STATS.map((stat) => (
+                        <th key={stat} className="text-right font-semibold py-1 px-1">
+                          {stat}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr className="border-t border-white/5">
+                      <td className="py-1 font-medium text-accent">Home</td>
+                      <td className="py-1 text-right font-mono font-bold">{teamTotals.points}</td>
+                      {SHOT_TYPES.map((shot) => {
+                        const d = teamTotals.shots[shot.key];
+                        const a = d.makes + d.misses;
+                        return (
+                          <td key={`box-home-${shot.key}`} className="py-1 px-1 text-right font-mono text-gray-300">
+                            {a > 0 ? `${d.makes}/${a}` : "-"}
+                          </td>
+                        );
+                      })}
+                      {OTHER_STATS.map((stat) => (
+                        <td key={`box-home-${stat}`} className="py-1 px-1 text-right font-mono text-gray-400">
+                          {teamTotals.others[stat] || "-"}
+                        </td>
+                      ))}
+                    </tr>
+                    <tr className="border-t border-white/5">
+                      <td className="py-1 font-medium text-red-400">Opponent</td>
+                      <td className="py-1 text-right font-mono font-bold">{opponentTotals.points}</td>
+                      {SHOT_TYPES.map((shot) => {
+                        const d = opponentTotals.shots[shot.key];
+                        const a = d.makes + d.misses;
+                        return (
+                          <td key={`box-opp-${shot.key}`} className="py-1 px-1 text-right font-mono text-gray-300">
+                            {a > 0 ? `${d.makes}/${a}` : "-"}
+                          </td>
+                        );
+                      })}
+                      {OTHER_STATS.map((stat) => (
+                        <td key={`box-opp-${stat}`} className="py-1 px-1 text-right font-mono text-gray-400">
+                          {opponentTotals.others[stat] || "-"}
+                        </td>
+                      ))}
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
         </div>
 
         {/* Controls — always docked at the bottom of the scoreboard section */}
         <div className="pt-3 flex flex-col gap-2">
-          <div className="flex justify-center">
+          <div className="flex justify-center items-center gap-3 group/transport">
+            <button
+              type="button"
+              onClick={() => {
+                if (!videoSrc) return;
+                videoEngine.seek(Math.max(0, currentTime - 5));
+              }}
+              disabled={!videoSrc}
+              className="text-gray-500 hover:text-accent text-lg leading-none transition-all opacity-0 group-hover/transport:opacity-100 disabled:opacity-0 disabled:cursor-not-allowed"
+              title="Back 5 sec"
+            >
+              <span className="inline-block -rotate-90">↺</span>
+            </button>
             <button
               type="button"
               onClick={handleScoreboardPlayPause}
@@ -589,6 +694,18 @@ export function ScoringPanel() {
               title="Play/Pause"
             >
               {isPlaying ? "⏸" : "▶"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                if (!videoSrc) return;
+                videoEngine.seek(Math.min(duration, currentTime + 5));
+              }}
+              disabled={!videoSrc}
+              className="text-gray-500 hover:text-accent text-lg leading-none transition-all opacity-0 group-hover/transport:opacity-100 disabled:opacity-0 disabled:cursor-not-allowed"
+              title="Forward 5 sec"
+            >
+              <span className="inline-block rotate-90">↻</span>
             </button>
           </div>
           <div className="grid grid-cols-3 items-end gap-2">
