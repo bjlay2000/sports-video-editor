@@ -3,7 +3,7 @@ import { exists, readFile, writeFile } from "@tauri-apps/plugin-fs";
 import { useAppStore } from "../store/appStore";
 import { useTimelineStore } from "../store/timelineStore";
 import { useVideoStore, type MediaClip } from "../store/videoStore";
-import type { Overlay, VideoTrackKeyframe } from "../engine/types";
+import type { Overlay, VideoTrackKeyframe, ViewportState } from "../engine/types";
 import type { ScoreAdjustmentEvent, Play, Player, TimelineMarker, OnCourtInterval } from "../store/types";
 import type { TimelineSegment } from "../store/timelineStore";
 import { DatabaseService } from "./DatabaseService";
@@ -62,6 +62,7 @@ interface ProjectSnapshotV2 {
     duration: number;
     zoomPercent: number;
     panOffset: { x: number; y: number };
+    viewport?: ViewportState;
     keyframeMode: boolean;
     overlays: Overlay[];
     videoTrackKeyframes: VideoTrackKeyframe[];
@@ -140,7 +141,24 @@ async function persistMutableDataToDb(): Promise<void> {
   }));
   await DatabaseService.saveTimelineClips(dbClips);
 
-  // player shifts (from onCourtIntervals)
+  // score events (no FK dependencies)
+  const allEvents = [
+    ...app.homeScoreEvents.map((e) => ({ team: "home", time: e.time, score: e.score })),
+    ...app.opponentScoreEvents.map((e) => ({ team: "away", time: e.time, score: e.score })),
+  ];
+  await DatabaseService.saveScoreEvents(allEvents);
+
+  // IMPORTANT: FK ordering — plays and shifts reference players(id).
+  // We must clear FK-dependent tables before deleting/replacing players,
+  // then re-populate them once the new players are committed.
+  await DatabaseService.savePlaysBulk([]);
+  await DatabaseService.savePlayerShifts([]);
+
+  // Now safe to replace players (child tables are empty)
+  await DatabaseService.savePlayersBulk(app.players);
+
+  // Re-populate FK-dependent tables (players exist now)
+  await DatabaseService.savePlaysBulk(app.plays);
   await DatabaseService.savePlayerShifts(
     app.onCourtIntervals.map((iv) => ({
       player_id: iv.player_id,
@@ -148,17 +166,6 @@ async function persistMutableDataToDb(): Promise<void> {
       exit_time: iv.exit_time,
     })),
   );
-
-  // score events (home + away)
-  const allEvents = [
-    ...app.homeScoreEvents.map((e) => ({ team: "home", time: e.time, score: e.score })),
-    ...app.opponentScoreEvents.map((e) => ({ team: "away", time: e.time, score: e.score })),
-  ];
-  await DatabaseService.saveScoreEvents(allEvents);
-
-  // players & plays (bulk replace so DB matches Zustand exactly)
-  await DatabaseService.savePlayersBulk(app.players);
-  await DatabaseService.savePlaysBulk(app.plays);
 
   // game score
   await DatabaseService.updateScore(app.game.home_score, app.game.away_score);
@@ -276,6 +283,7 @@ export class ProjectService {
         duration: video.duration,
         zoomPercent: video.zoomPercent,
         panOffset: video.panOffset,
+        viewport: video.viewport,
         keyframeMode: video.keyframeMode,
         overlays: video.overlays,
         videoTrackKeyframes: video.videoTrackKeyframes,
@@ -426,11 +434,6 @@ export class ProjectService {
     video: ProjectSnapshotV2["video"],
     timeline: ProjectSnapshotV2["timeline"] & { segments?: TimelineSegment[]; selectedSegmentId?: string | null },
   ): Promise<void> {
-    // Step 9: Close any shifts left open from a crash
-    if (video.duration > 0) {
-      await DatabaseService.closeOpenShifts(video.duration);
-    }
-
     const timelinePosition = Number.isFinite(timeline.playheadTime)
       ? Math.max(0, timeline.playheadTime)
       : Number.isFinite(video.currentTime)
@@ -464,6 +467,13 @@ export class ProjectService {
       showAddPlayerModal: false,
     });
 
+    // Sanitize overlays: JSON.stringify serializes Infinity as null, so restore it
+    const sanitizedOverlays = (video.overlays ?? []).map((o) => ({
+      ...o,
+      startTime: o.startTime == null || !Number.isFinite(o.startTime) ? 0 : o.startTime,
+      endTime: o.endTime == null || !Number.isFinite(o.endTime) ? Infinity : o.endTime,
+    }));
+
     useVideoStore.setState({
       videoPath: activeClip?.path ?? video.videoPath ?? null,
       videoSrc: activeClip?.src ?? (video.videoPath ? convertFileSrc(video.videoPath) : null),
@@ -473,8 +483,9 @@ export class ProjectService {
       duration: video.duration,
       zoomPercent: video.zoomPercent,
       panOffset: video.panOffset,
+      viewport: video.viewport ?? { zoom: (video.zoomPercent ?? 100) / 100, panX: 0, panY: 0 },
       keyframeMode: video.keyframeMode,
-      overlays: video.overlays,
+      overlays: sanitizedOverlays,
       videoTrackKeyframes: video.videoTrackKeyframes,
       showScoreboardOverlay: video.showScoreboardOverlay,
       selectedOverlayIds: [],

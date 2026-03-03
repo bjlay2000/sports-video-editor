@@ -28,6 +28,7 @@ const STAT_COLORS: Record<string, string> = {
 const MAX_TAG_ROWS = 3;
 const TAG_ROW_HEIGHT = 20;
 const TAG_ROW_GAP = 6;
+const SELECTED_STAT_HIGHLIGHT = "#a855f7";
 
 interface MarkerBlockLayout {
   marker: TimelineMarker;
@@ -325,9 +326,19 @@ export function TimelineRenderer({
         className={`absolute flex -translate-x-1/2 -translate-y-1/2 items-center gap-1 rounded-full border px-3 py-1 text-[10px] uppercase tracking-wide shadow-lg shadow-black/40 ${
           missTag
             ? "border-gray-200/70 bg-transparent text-gray-300"
-            : "border-white/10 bg-[#050512] text-gray-200"
+            : selected
+              ? "bg-[#050512] text-gray-100"
+              : "border-white/10 bg-[#050512] text-gray-200"
         }`}
-        style={{ left: safeX, top: "50%", zIndex: selected ? 30 : 10 }}
+        style={{
+          left: safeX,
+          top: "50%",
+          zIndex: selected ? 30 : 10,
+          borderColor: selected ? SELECTED_STAT_HIGHLIGHT : undefined,
+          boxShadow: selected
+            ? `0 0 0 2px rgba(168, 85, 247, 0.65), 0 10px 20px rgba(0,0,0,0.40)`
+            : undefined,
+        }}
         data-marker-pin
         onClick={(event) => {
           onSelectMarker(marker.id, event.metaKey || event.ctrlKey || event.shiftKey);
@@ -419,14 +430,18 @@ export function TimelineRenderer({
       key={`block-${entry.marker.id}`}
       data-marker-block
       className={`group absolute flex items-center gap-2 rounded-md border-2 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-black/80 shadow-[inset_0_0_6px_rgba(0,0,0,0.25)] ${
-        entry.selected ? "ring-2 ring-yellow-200/70" : ""
+        entry.selected ? "ring-2 ring-purple-400/80" : ""
       }`}
       style={{
         left: entry.projectStart * pixelsPerSecond,
         width: entry.width,
         top: entry.row * (TAG_ROW_HEIGHT + TAG_ROW_GAP),
         height: TAG_ROW_HEIGHT,
-        borderColor: entry.missTag ? "rgba(229, 231, 235, 0.85)" : entry.color,
+        borderColor: entry.selected
+          ? SELECTED_STAT_HIGHLIGHT
+          : entry.missTag
+            ? "rgba(229, 231, 235, 0.85)"
+            : entry.color,
         backgroundColor: entry.missTag
           ? "rgba(0, 0, 0, 0)"
           : hexToRgba(entry.color, entry.selected ? 0.95 : 0.8),
@@ -673,10 +688,10 @@ export function TimelineRenderer({
             </button>
           </div>
         </div>
-        {thumbnailsGenerating && thumbnails.length === 0 && (
+        {thumbnailsGenerating && (
           <div className="absolute bottom-2 left-1/2 z-10 -translate-x-1/2 rounded-full bg-black/70 px-3 py-1 text-xs text-gray-400 shadow-lg">
             <span className="mr-1.5 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
-            Generating preview frames…
+            Generating timeline previews — you can keep working
           </div>
         )}
       </div>

@@ -1,4 +1,4 @@
-import { exists, mkdir, readDir, remove } from "@tauri-apps/plugin-fs";
+import { exists, mkdir, readDir, remove, stat, writeFile, readFile } from "@tauri-apps/plugin-fs";
 import { appCacheDir, join } from "@tauri-apps/api/path";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { TimelineThumbnail } from "../store/timelineStore";
@@ -36,6 +36,35 @@ async function resetDir(path: string) {
   await mkdir(path, { recursive: true });
 }
 
+/** Simple hash from path + size + mtime for cache invalidation. */
+async function computeVideoHash(videoPath: string): Promise<string> {
+  try {
+    const info = await stat(videoPath);
+    const raw = `${videoPath}|${info.size ?? 0}|${info.mtime?.getTime() ?? 0}`;
+    // Use SubtleCrypto SHA-1 when available, else fallback to simple hash
+    if (typeof crypto !== "undefined" && crypto.subtle) {
+      const data = new TextEncoder().encode(raw);
+      const buf = await crypto.subtle.digest("SHA-1", data);
+      return Array.from(new Uint8Array(buf))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+    }
+    // Fallback: simple djb2 hash
+    let hash = 5381;
+    for (let i = 0; i < raw.length; i++) {
+      hash = ((hash << 5) + hash + raw.charCodeAt(i)) >>> 0;
+    }
+    return hash.toString(16);
+  } catch {
+    return `fallback-${Date.now()}`;
+  }
+}
+
+interface CacheMetadata {
+  videoHash: string;
+  thumbCount: number;
+}
+
 export class MediaProcessingService {
   /**
    * Generate timeline thumbnails + waveform for a video clip.
@@ -60,9 +89,47 @@ export class MediaProcessingService {
     await ensureDir(previewsRoot);
 
     const clipFolder = await join(previewsRoot, sanitizeSegment(videoPath));
-    await resetDir(clipFolder);
+    await ensureDir(clipFolder);
 
     const token = callbacks?.cancelToken;
+
+    // ── Cache check: reuse thumbnails if video hasn't changed ──
+    const videoHash = await computeVideoHash(videoPath);
+    const metadataPath = await join(clipFolder, "metadata.json");
+    let cacheValid = false;
+    try {
+      if (await exists(metadataPath)) {
+        const raw = new TextDecoder().decode(await readFile(metadataPath));
+        const meta: CacheMetadata = JSON.parse(raw);
+        if (meta.videoHash === videoHash && meta.thumbCount > 0) {
+          // Verify thumbnails still exist
+          const existing = await this.scanAllThumbnails(clipFolder, duration);
+          if (existing.length >= meta.thumbCount) {
+            cacheValid = true;
+            callbacks?.onThumbnailsUpdate?.(existing);
+
+            // Also check for waveform
+            const waveformPath = await join(clipFolder, "waveform.png");
+            const waveformSrc = (await exists(waveformPath))
+              ? convertFileSrc(waveformPath)
+              : null;
+            if (waveformSrc) callbacks?.onWaveform?.(waveformSrc);
+
+            return {
+              thumbnails: existing,
+              waveformSrc,
+              poster: existing[0]?.src ?? null,
+            };
+          }
+        }
+      }
+    } catch {
+      // Cache read failed — regenerate
+    }
+
+    if (!cacheValid) {
+      await resetDir(clipFolder);
+    }
 
     // Run thumbnails and waveform concurrently
     const [thumbResult, waveformResult] = await Promise.allSettled([
@@ -84,6 +151,17 @@ export class MediaProcessingService {
       console.warn("Waveform generation failed:", waveformResult.reason);
     }
 
+    // Write cache metadata for reuse on next load
+    try {
+      const meta: CacheMetadata = { videoHash, thumbCount: thumbnails.length };
+      await writeFile(
+        metadataPath,
+        new TextEncoder().encode(JSON.stringify(meta)),
+      );
+    } catch {
+      // Non-critical — cache metadata write failed
+    }
+
     return {
       thumbnails,
       waveformSrc,
@@ -102,21 +180,21 @@ export class MediaProcessingService {
     const token = callbacks?.cancelToken;
     if (token?.cancelled) throw new Error("Generation cancelled");
 
-    // Target ~1 thumb per 4 seconds, capped at 30 total.
-    // For a 2-minute clip → 30 thumbs.  For a 30s clip → 8 thumbs.
-    // This is drastically more efficient than 1/sec or 1/2sec on 4K footage.
-    const thumbnailTarget = Math.min(30, Math.max(8, Math.round(duration / 4)));
+    // Cap at 90 thumbnails regardless of video length.
+    const MAX_THUMBS = 90;
+    const thumbnailTarget = Math.min(MAX_THUMBS, Math.max(8, Math.round(duration / 4)));
     const fps = duration > 0 ? thumbnailTarget / duration : 1;
     const thumbPattern = await join(clipFolder, "thumb_%04d.jpg");
 
     const thumbArgs = [
       "-y",
+      "-threads", "1",                 // single thread — less contention with the UI
       "-skip_frame", "nokey",          // only decode I-frames (huge speedup on 4K)
       "-an",                            // skip audio — not needed for thumbnails
       "-i", videoPath,
-      "-vf", `fps=${fps.toFixed(4)},scale=160:-1`,   // 160px wide is plenty for timeline strips
+      "-vf", `fps=${fps.toFixed(4)},scale=320:-1:flags=fast_bilinear`,  // 320px wide, fast scaling
       "-vsync", "vfr",                 // variable frame-rate to match keyframe timing
-      "-qscale:v", "5",                // lower quality = faster writes, fine for tiny timeline thumbs
+      "-q:v", "9",                     // low-quality JPEG — fine for tiny timeline thumbs
       thumbPattern,
     ];
 
@@ -128,7 +206,7 @@ export class MediaProcessingService {
 
     const poll = async () => {
       while (pollActive && !token?.cancelled) {
-        await new Promise((r) => setTimeout(r, 400));
+        await new Promise((r) => setTimeout(r, 250));
         if (!pollActive || token?.cancelled) break;
         try {
           const thumbs = await this.scanAllThumbnails(clipFolder, duration);

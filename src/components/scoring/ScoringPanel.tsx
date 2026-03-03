@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { save } from "@tauri-apps/plugin-dialog";
+import { confirm, save } from "@tauri-apps/plugin-dialog";
 import { writeFile } from "@tauri-apps/plugin-fs";
 import { useAppStore } from "../../store/appStore";
 import { useVideoStore } from "../../store/videoStore";
@@ -124,23 +124,18 @@ export function ScoringPanel() {
   const videoSrc = useVideoStore((s) => s.videoSrc);
   const currentTime = useVideoStore((s) => s.currentTime);
   const duration = useVideoStore((s) => s.duration);
-  const setVideoTime = useVideoStore((s) => s.setCurrentTime);
   const showScoreboardOverlay = useVideoStore((s) => s.showScoreboardOverlay);
   const toggleScoreboardOverlay = useVideoStore((s) => s.toggleScoreboardOverlay);
-  const setPlayheadTime = useTimelineStore((s) => s.setPlayheadTime);
   const segments = useTimelineStore((s) => s.segments);
   const isPlaying = useVideoStore((s) => s.isPlaying);
   const setIsPlaying = useVideoStore((s) => s.setIsPlaying);
   const [showStatsDrawer, setShowStatsDrawer] = useState(false);
-  const [recentScrollTop, setRecentScrollTop] = useState(0);
   const [exportingStats, setExportingStats] = useState(false);
   const [showSubModal, setShowSubModal] = useState(false);
   const [playedPercentages, setPlayedPercentages] = useState<PlayerPlayedPercentage[]>([]);
   const [rosters, setRosters] = useState<Array<{ roster_id: number; name: string }>>([]);
-  const [selectedRosterId, setSelectedRosterId] = useState<string>(() => {
-    const stored = localStorage.getItem("sve.selectedRosterId");
-    return stored ?? "";
-  });
+  const [selectedRosterId, setSelectedRosterId] = useState<string>("");
+  const gameResetVersion = useAppStore((s) => s.gameResetVersion);
 
   // Fetch DB-derived played % from backend only
   useEffect(() => {
@@ -166,10 +161,6 @@ export function ScoringPanel() {
       .then((items) => {
         if (!cancelled) {
           setRosters(items.map((r) => ({ roster_id: r.roster_id, name: r.name })));
-          const current = localStorage.getItem("sve.selectedRosterId");
-          if (!current) {
-            setSelectedRosterId("");
-          }
         }
       })
       .catch((error) => {
@@ -180,19 +171,17 @@ export function ScoringPanel() {
     };
   }, []);
 
-  const handleRosterSelection = async (nextValue: string) => {
-    setSelectedRosterId(nextValue);
-    if (!nextValue) {
-      localStorage.removeItem("sve.selectedRosterId");
-      return;
+  // Reset roster selection when a new game starts
+  useEffect(() => {
+    if (gameResetVersion > 0) {
+      setSelectedRosterId("");
     }
+  }, [gameResetVersion]);
 
-    localStorage.setItem("sve.selectedRosterId", nextValue);
-
-    const shouldReplace = window.confirm(
-      "Replace current project roster with this saved roster? This updates project players only.",
-    );
-    if (!shouldReplace) {
+  const handleRosterSelection = async (nextValue: string) => {
+    if (!nextValue) {
+      setSelectedRosterId("");
+      localStorage.removeItem("sve.selectedRosterId");
       return;
     }
 
@@ -200,6 +189,9 @@ export function ScoringPanel() {
       window.alert("Clear stat tags before replacing roster, then try again.");
       return;
     }
+
+    setSelectedRosterId(nextValue);
+    localStorage.setItem("sve.selectedRosterId", nextValue);
 
     try {
       await ProjectService.ensureProjectDbOpen();
@@ -224,7 +216,12 @@ export function ScoringPanel() {
     if (!Number.isFinite(rosterId) || rosterId <= 0) return;
 
     const target = rosters.find((r) => r.roster_id === rosterId);
-    const ok = window.confirm(`Delete saved roster \"${target?.name ?? "this roster"}\"?`);
+    const ok = await confirm(`Delete saved roster \"${target?.name ?? "this roster"}\"?`, {
+      title: "Delete Roster",
+      kind: "warning",
+      okLabel: "Delete",
+      cancelLabel: "Cancel",
+    });
     if (!ok) return;
 
     try {
@@ -233,6 +230,10 @@ export function ScoringPanel() {
       setRosters(refreshed.map((r) => ({ roster_id: r.roster_id, name: r.name })));
       setSelectedRosterId("");
       localStorage.removeItem("sve.selectedRosterId");
+      // Clear players from both in-memory state AND the project database
+      await DatabaseService.savePlayersBulk([]);
+      setPlayers([]);
+      resetOnCourtTracking();
     } catch (error) {
       console.error("Failed to delete roster", error);
     }
@@ -287,34 +288,6 @@ export function ScoringPanel() {
     setGame(updated);
     logHomeScoreEvent(nextHome, currentTime);
   };
-
-  const recentPlays = [...plays]
-    .sort((a, b) => b.timestamp - a.timestamp);
-
-  const rowHeight = 38;
-  const listViewportHeight = 300;
-  const overscanRows = 8;
-  const startIndex = Math.max(0, Math.floor(recentScrollTop / rowHeight) - overscanRows);
-  const endIndex = Math.min(
-    recentPlays.length,
-    Math.ceil((recentScrollTop + listViewportHeight) / rowHeight) + overscanRows,
-  );
-  const virtualRows = recentPlays.slice(startIndex, endIndex);
-
-  const handleDeletePlay = async (id: number) => {
-    await PlayCoordinator.removePlays([id]);
-  };
-
-  const jumpToPlayStart = useCallback(
-    (start: number) => {
-      if (!videoSrc) return;
-      const target = Math.max(0, start);
-      videoEngine.seek(target);
-      setVideoTime(target);
-      setPlayheadTime(target);
-    },
-    [setPlayheadTime, setVideoTime, videoSrc]
-  );
 
   const handleScoreboardPlayPause = useCallback(async () => {
     if (!videoSrc) return;
@@ -451,8 +424,8 @@ export function ScoringPanel() {
   }, [statRows, teamTotals]);
 
   return (
-    <div className="h-full flex flex-col bg-panel overflow-hidden">
-      <div className="p-3 border-b border-panel-border">
+    <div id="scoring-panel" className="relative h-full flex flex-col bg-panel overflow-hidden">
+      <div className="flex-1 p-3 border-b border-panel-border flex flex-col min-h-0">
         <div className="flex flex-wrap items-center justify-between mb-3 gap-3">
           <div className="flex items-center gap-4">
             <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wider">
@@ -477,36 +450,148 @@ export function ScoringPanel() {
               </button>
             </div>
           </div>
-          <div className="flex flex-col gap-2">
-            <button
-              onClick={() => setShowAddPlayerModal(true)}
-              className="text-xs px-2 py-1 bg-accent hover:bg-accent-hover rounded transition-colors"
-            >
-              + Player
-            </button>
-            <button
-              onClick={() => {
-                setShowStatsDrawer((prev) => !prev);
-              }}
-              className="text-xs px-2 py-1 bg-panel hover:bg-panel-border rounded transition-colors text-gray-200"
-            >
-              {showStatsDrawer ? "Hide Stats" : "Game Stats"}
-            </button>
-          </div>
+          <button
+            onClick={() => {
+              setShowStatsDrawer((prev) => !prev);
+            }}
+            className="text-xs px-2 py-1 bg-panel hover:bg-panel-border rounded transition-colors text-gray-200"
+          >
+            {showStatsDrawer ? "Hide Stats" : "Game Stats"}
+          </button>
         </div>
-        <div className="relative">
+
+        {/* Score display — centered vertically in the available space */}
+        <div className="flex-1 flex items-center justify-center min-h-0">
           <div className="flex justify-center gap-8 py-2">
-          <div className="text-center">
-            <div className="text-3xl font-bold text-white">{game.home_score}</div>
-            <div className="text-xs text-gray-400 mt-1">HOME</div>
-          </div>
-          <div className="text-2xl text-gray-500 self-center">—</div>
-          <div className="text-center">
-            <div className="text-3xl font-bold text-white">{game.away_score}</div>
-            <div className="text-xs text-gray-400 mt-1">AWAY</div>
+            <div className="text-center">
+              <div className="text-3xl font-bold text-white">{game.home_score}</div>
+              <div className="text-xs text-gray-400 mt-1">HOME</div>
+            </div>
+            <div className="text-2xl text-gray-500 self-center">—</div>
+            <div className="text-center">
+              <div className="text-3xl font-bold text-white">{game.away_score}</div>
+              <div className="text-xs text-gray-400 mt-1">AWAY</div>
+            </div>
           </div>
         </div>
-          <div className="mt-3 flex justify-between items-end gap-4">
+
+        {/* Stats drawer — animated overlay sliding in from the right */}
+        <div
+          className={`absolute inset-0 z-10 bg-panel flex flex-col transition-transform duration-300 ease-in-out ${
+            showStatsDrawer ? "translate-x-0" : "translate-x-full"
+          }`}
+        >
+          <div className="flex items-center justify-between p-3 border-b border-panel-border flex-shrink-0">
+            <h4 className="text-xs font-semibold text-gray-300 uppercase tracking-wider">
+              Game Stats
+            </h4>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                title="Export Stats CSV"
+                onClick={handleExportStatsCsv}
+                disabled={exportingStats || statRows.length === 0}
+                className="rounded px-2 py-1 text-xs text-gray-300 hover:bg-panel-border disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                ⤓
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowStatsDrawer(false)}
+                className="rounded px-2 py-1 text-xs text-gray-400 hover:text-white hover:bg-panel-border transition-colors"
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+          <div className="flex-1 overflow-auto p-3">
+            {statRows.length === 0 ? (
+              <p className="text-xs text-gray-500">No players added yet.</p>
+            ) : (
+              <table className="w-full text-[11px] text-gray-200">
+                <thead>
+                  <tr className="text-[10px] uppercase tracking-wider text-gray-500">
+                    <th className="text-left font-semibold py-1">Player</th>
+                    <th className="text-right font-semibold py-1">PTS</th>
+                    <th className="text-right font-semibold py-1">% Played</th>
+                    {SHOT_TYPES.map((shot) => (
+                      <th key={shot.key} className="text-right font-semibold py-1 px-1">
+                        {shot.label} (M/A)
+                      </th>
+                    ))}
+                    {OTHER_STATS.map((stat) => (
+                      <th key={stat} className="text-right font-semibold py-1 px-1">
+                        {stat}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {statRows.map(({ player, shots, others, points, percentPlayed }) => (
+                    <tr key={player.id} className="border-t border-white/5">
+                      <td className="py-1 font-medium">
+                        #{player.number} {player.name}
+                      </td>
+                      <td className="py-1 text-right font-mono">{points}</td>
+                      <td className="py-1 text-right font-mono">{percentPlayed.toFixed(1)}%</td>
+                      {SHOT_TYPES.map((shot) => {
+                        const data = shots[shot.key];
+                        const attempts = data.makes + data.misses;
+                        return (
+                          <td key={`${player.id}-${shot.key}`} className="py-1 px-1 text-right font-mono text-gray-300">
+                            {attempts > 0 ? `${data.makes}/${attempts}` : "-"}
+                          </td>
+                        );
+                      })}
+                      {OTHER_STATS.map((stat) => (
+                        <td key={`${player.id}-${stat}`} className="py-1 px-1 text-right font-mono text-gray-400">
+                          {others[stat] ?? "-"}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr className="border-t border-white/10 text-accent">
+                    <td className="py-1 font-semibold">Team Total</td>
+                    <td className="py-1 text-right font-mono">{teamTotals.points}</td>
+                    <td className="py-1 text-right font-mono">{teamTotals.teamPlayedPercent.toFixed(1)}%</td>
+                    {SHOT_TYPES.map((shot) => {
+                      const data = teamTotals.shots[shot.key];
+                      const attempts = data.makes + data.misses;
+                      return (
+                        <td key={`total-${shot.key}`} className="py-1 px-1 text-right font-mono">
+                          {attempts > 0 ? `${data.makes}/${attempts}` : "-"}
+                        </td>
+                      );
+                    })}
+                    {OTHER_STATS.map((stat) => (
+                      <td key={`total-${stat}`} className="py-1 px-1 text-right font-mono">
+                        {teamTotals.others[stat] ?? "-"}
+                      </td>
+                    ))}
+                  </tr>
+                </tfoot>
+              </table>
+            )}
+          </div>
+        </div>
+
+        {/* Controls — always docked at the bottom of the scoreboard section */}
+        <div className="pt-3 flex flex-col gap-2">
+          <div className="flex justify-center">
+            <button
+              type="button"
+              onClick={handleScoreboardPlayPause}
+              disabled={!videoSrc}
+              className="text-white hover:text-accent text-3xl leading-none transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+              title="Play/Pause"
+            >
+              {isPlaying ? "⏸" : "▶"}
+            </button>
+          </div>
+          <div className="grid grid-cols-3 items-end gap-2">
             <div className="flex flex-col items-start gap-1 text-[11px] text-gray-400 uppercase tracking-wider">
               <span>Home Score</span>
               <div className="flex overflow-hidden rounded border border-panel-border">
@@ -526,21 +611,12 @@ export function ScoringPanel() {
                 </button>
               </div>
             </div>
-            <div className="flex flex-col items-center gap-1 pb-0.5">
-              <button
-                type="button"
-                onClick={handleScoreboardPlayPause}
-                disabled={!videoSrc}
-                className="text-white hover:text-accent text-3xl leading-none transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-                title="Play/Pause"
-              >
-                {isPlaying ? "⏸" : "▶"}
-              </button>
+            <div className="flex justify-center">
               <button
                 type="button"
                 onClick={() => setShowSubModal(true)}
                 disabled={players.length === 0}
-                className="text-[10px] px-2 py-0.5 bg-panel hover:bg-panel-border rounded border border-panel-border text-gray-300 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                className="text-[10px] px-2 py-0.5 rounded border transition-all duration-150 disabled:opacity-30 disabled:cursor-not-allowed bg-panel border-accent text-gray-300 hover:text-accent hover:border-white hover:shadow-[0_0_8px_rgba(255,255,255,0.3)]"
                 title="Substitutions"
               >
                 Sub
@@ -566,96 +642,6 @@ export function ScoringPanel() {
               </div>
             </div>
           </div>
-
-          {showStatsDrawer && (
-          <div className="mt-2 rounded-lg border border-panel-border bg-surface p-3 shadow-inner shadow-black/30">
-              <div className="mb-2 flex items-center justify-between">
-                <h4 className="text-xs font-semibold text-gray-300 uppercase tracking-wider">
-                  Player Stats
-                </h4>
-                <button
-                  type="button"
-                  title="Export Stats"
-                  onClick={handleExportStatsCsv}
-                  disabled={exportingStats || statRows.length === 0}
-                  className="rounded px-2 py-1 text-xs text-gray-300 hover:bg-panel-border disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  ⤓
-                </button>
-              </div>
-              {statRows.length === 0 ? (
-                <p className="text-xs text-gray-500">No players added yet.</p>
-              ) : (
-                <div className="overflow-auto max-h-[44vh] pr-1">
-                  <table className="w-full text-[11px] text-gray-200">
-                    <thead>
-                      <tr className="text-[10px] uppercase tracking-wider text-gray-500">
-                        <th className="text-left font-semibold py-1">Player</th>
-                        <th className="text-right font-semibold py-1">PTS</th>
-                        <th className="text-right font-semibold py-1">% Played</th>
-                        {SHOT_TYPES.map((shot) => (
-                          <th key={shot.key} className="text-right font-semibold py-1 px-1">
-                            {shot.label} (M/A)
-                          </th>
-                        ))}
-                        {OTHER_STATS.map((stat) => (
-                          <th key={stat} className="text-right font-semibold py-1 px-1">
-                            {stat}
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {statRows.map(({ player, shots, others, points, percentPlayed }) => (
-                        <tr key={player.id} className="border-t border-white/5">
-                          <td className="py-1 font-medium">
-                            #{player.number} {player.name}
-                          </td>
-                          <td className="py-1 text-right font-mono">{points}</td>
-                          <td className="py-1 text-right font-mono">{percentPlayed.toFixed(1)}%</td>
-                          {SHOT_TYPES.map((shot) => {
-                            const data = shots[shot.key];
-                            const attempts = data.makes + data.misses;
-                            return (
-                              <td key={`${player.id}-${shot.key}`} className="py-1 px-1 text-right font-mono text-gray-300">
-                                {attempts > 0 ? `${data.makes}/${attempts}` : "-"}
-                              </td>
-                            );
-                          })}
-                          {OTHER_STATS.map((stat) => (
-                            <td key={`${player.id}-${stat}`} className="py-1 px-1 text-right font-mono text-gray-400">
-                              {others[stat] ?? "-"}
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                    <tfoot>
-                      <tr className="border-t border-white/10 text-accent">
-                        <td className="py-1 font-semibold">Team Total</td>
-                        <td className="py-1 text-right font-mono">{teamTotals.points}</td>
-                        <td className="py-1 text-right font-mono">{teamTotals.teamPlayedPercent.toFixed(1)}%</td>
-                        {SHOT_TYPES.map((shot) => {
-                          const data = teamTotals.shots[shot.key];
-                          const attempts = data.makes + data.misses;
-                          return (
-                            <td key={`total-${shot.key}`} className="py-1 px-1 text-right font-mono">
-                              {attempts > 0 ? `${data.makes}/${attempts}` : "-"}
-                            </td>
-                          );
-                        })}
-                        {OTHER_STATS.map((stat) => (
-                          <td key={`total-${stat}`} className="py-1 px-1 text-right font-mono">
-                            {teamTotals.others[stat] ?? "-"}
-                          </td>
-                        ))}
-                      </tr>
-                    </tfoot>
-                  </table>
-                </div>
-              )}
-          </div>
-          )}
         </div>
       </div>
 
@@ -697,64 +683,6 @@ export function ScoringPanel() {
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-3">
-        <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">
-          Recent Plays
-        </h3>
-        {recentPlays.length === 0 ? (
-          <p className="text-xs text-gray-500">No plays recorded</p>
-        ) : (
-          <div
-            className="overflow-y-auto"
-            style={{ height: `${listViewportHeight}px` }}
-            onScroll={(event) => setRecentScrollTop(event.currentTarget.scrollTop)}
-          >
-            <div style={{ height: `${recentPlays.length * rowHeight}px`, position: "relative" }}>
-            {virtualRows.map((play, idx) => (
-              <div
-                key={play.id}
-                role="button"
-                tabIndex={0}
-                className="group relative flex items-center gap-2 text-xs bg-surface rounded px-2 py-1.5 cursor-pointer hover:bg-panel-border/60 focus:outline-none focus:ring-1 focus:ring-accent"
-                style={{
-                  position: "absolute",
-                  left: 0,
-                  right: 0,
-                  top: `${(startIndex + idx) * rowHeight}px`,
-                  height: `${rowHeight - 4}px`,
-                }}
-                onClick={() => jumpToPlayStart(play.start_time ?? play.timestamp)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
-                    jumpToPlayStart(play.start_time ?? play.timestamp);
-                  }
-                }}
-              >
-                <span className="text-accent font-bold w-12">{formatEventLabel(play.event_type)}</span>
-                <span className="text-gray-300 flex-1 truncate">
-                  #{play.player_number} {play.player_name}
-                </span>
-                <span className="text-gray-500 font-mono transition-all group-hover:pr-6">
-                  {play.timestamp.toFixed(1)}s
-                </span>
-                <button
-                  className="absolute right-3 opacity-0 group-hover:opacity-100 transition-opacity text-gray-500 hover:text-red-400"
-                  aria-label="Delete play"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    handleDeletePlay(play.id);
-                  }}
-                >
-                  🗑
-                </button>
-              </div>
-            ))}
-            </div>
-          </div>
-        )}
-      </div>
-
       <div className="p-3 border-t border-panel-border">
         <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-1">
           Roster ({players.length})
@@ -767,7 +695,7 @@ export function ScoringPanel() {
             }}
             className="flex-1 px-2 py-1 bg-surface border border-panel-border rounded text-xs text-gray-200"
           >
-            <option value="">Select saved roster</option>
+            <option value="">Select a saved roster</option>
             {rosters.map((roster) => (
               <option key={roster.roster_id} value={roster.roster_id}>
                 {roster.name}
@@ -793,17 +721,25 @@ export function ScoringPanel() {
             Save As Roster
           </button>
         </div>
-        <div className="flex flex-wrap gap-1">
-          {players.map((p) => (
-            <button
-              key={p.id}
-              onClick={() => setShowAddPlayerModal(true)}
-              className="text-xs bg-surface px-2 py-0.5 rounded text-gray-300 hover:bg-panel-border transition-colors"
-              title="Manage players"
-            >
-              #{p.number}
-            </button>
-          ))}
+        <div className="mb-2 flex items-start gap-2">
+          <div className="flex flex-wrap gap-1 flex-1">
+            {players.map((p) => (
+              <button
+                key={p.id}
+                onClick={() => setShowAddPlayerModal(true)}
+                className="text-xs bg-surface px-2 py-0.5 rounded text-gray-300 hover:bg-panel-border transition-colors"
+                title="Manage players"
+              >
+                #{p.number}
+              </button>
+            ))}
+          </div>
+          <button
+            onClick={() => setShowAddPlayerModal(true)}
+            className="text-xs px-2 py-1 bg-accent hover:bg-accent-hover rounded transition-colors shrink-0"
+          >
+            + Player
+          </button>
         </div>
       </div>
 

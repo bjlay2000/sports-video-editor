@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { TimelineThumbnail } from "./timelineStore";
-import type { Overlay, VideoTrackKeyframe } from "../engine/types";
+import type { Overlay, VideoTrackKeyframe, ViewportState } from "../engine/types";
 
 export type { Overlay };
 export type OverlayKind = Overlay["type"];
@@ -91,6 +91,7 @@ interface VideoState {
   videoHeight: number;
   clips: MediaClip[];
   activeClipId: string | null;
+  viewport: ViewportState;
   zoomPercent: number;
   panOffset: { x: number; y: number };
   keyframeMode: boolean;
@@ -109,6 +110,7 @@ interface VideoState {
   setActiveClip: (id: string | null) => void;
   setZoomPercent: (percent: number) => void;
   setPanOffset: (offset: { x: number; y: number }) => void;
+  setViewport: (viewport: Partial<ViewportState>) => void;
   resetTransform: () => void;
   toggleKeyframeMode: () => void;
   addTextOverlay: (overlay?: Partial<Overlay>) => string;
@@ -140,6 +142,7 @@ export const useVideoStore = create<VideoState>((set, get) => ({
   videoHeight: 0,
   clips: [],
   activeClipId: null,
+  viewport: { zoom: 1, panX: 0, panY: 0 },
   zoomPercent: 100,
   panOffset: { x: 0, y: 0 },
   keyframeMode: false,
@@ -147,32 +150,32 @@ export const useVideoStore = create<VideoState>((set, get) => ({
     {
       id: "score-home",
       type: "scoreboard",
-      zIndex: 1,
+      zIndex: 100,
       startTime: 0,
       endTime: Infinity,
-      base: { x: 40, y: 40, width: 180, height: 54 },
+      base: { x: 40, y: 40, width: 360, height: 108 },
       keyframes: [],
       text: "HOME",
       fontFamily: "Inter, sans-serif",
-      fontSize: 32,
+      fontSize: 64,
       color: "#ffffff",
-      visible: true,
+      visible: false,
       locked: true,
       dynamic: { type: "scoreboard" },
     },
     {
       id: "score-away",
       type: "scoreboard",
-      zIndex: 2,
+      zIndex: 101,
       startTime: 0,
       endTime: Infinity,
-      base: { x: 220, y: 40, width: 180, height: 54 },
+      base: { x: 490, y: 40, width: 360, height: 108 },
       keyframes: [],
       text: "AWAY",
       fontFamily: "Inter, sans-serif",
-      fontSize: 32,
+      fontSize: 64,
       color: "#ffffff",
-      visible: true,
+      visible: false,
       locked: true,
       dynamic: { type: "scoreboard" },
     },
@@ -186,9 +189,58 @@ export const useVideoStore = create<VideoState>((set, get) => ({
   setCurrentTime: (time) => set({ currentTime: time }),
   setDuration: (duration) => set({ duration }),
   setVideoDimensions: (width, height) =>
-    set({
-      videoWidth: Math.max(0, Math.floor(width)),
-      videoHeight: Math.max(0, Math.floor(height)),
+    set((state) => {
+      const vw = Math.max(0, Math.floor(width));
+      const vh = Math.max(0, Math.floor(height));
+
+      // Reposition scoreboard overlays to bottom-center on first load
+      // (only if they still have default position from store init)
+      const isDefaultHome = state.overlays.find(
+        (o) => o.id === "score-home" && o.base.x === 40 && o.base.y === 40,
+      );
+      const isDefaultAway = state.overlays.find(
+        (o) => o.id === "score-away" && o.base.x === 490 && o.base.y === 40,
+      );
+
+      // Always reposition + make visible when video dimensions are known
+      const homeOverlay = state.overlays.find((o) => o.id === "score-home");
+      const awayOverlay = state.overlays.find((o) => o.id === "score-away");
+      const needsReposition = (isDefaultHome || isDefaultAway) && vw > 0 && vh > 0;
+      const needsVisibility = vw > 0 && vh > 0 && (homeOverlay && !homeOverlay.visible || awayOverlay && !awayOverlay.visible);
+
+      if ((needsReposition || needsVisibility) && vw > 0 && vh > 0) {
+        const overlays = state.overlays.map((o) => {
+          if (o.id === "score-home") {
+            const base = isDefaultHome
+              ? (() => {
+                  const y = Math.floor(vh * 0.95 - o.base.height);
+                  const spacing = Math.floor(o.base.width * 0.25);
+                  const totalWidth = o.base.width * 2 + spacing;
+                  const x = Math.floor((vw - totalWidth) / 2);
+                  return { ...o.base, x: Math.max(0, x), y: Math.max(0, y) };
+                })()
+              : o.base;
+            return { ...o, base, visible: true };
+          }
+          if (o.id === "score-away") {
+            const base = isDefaultAway
+              ? (() => {
+                  const y = Math.floor(vh * 0.95 - o.base.height);
+                  const homeWidth = homeOverlay?.base.width ?? 360;
+                  const spacing = Math.floor(homeWidth * 0.25);
+                  const totalWidth = homeWidth * 2 + spacing;
+                  const x = Math.floor((vw - totalWidth) / 2) + homeWidth + spacing;
+                  return { ...o.base, x: Math.max(0, x), y: Math.max(0, y) };
+                })()
+              : o.base;
+            return { ...o, base, visible: true };
+          }
+          return o;
+        });
+        return { videoWidth: vw, videoHeight: vh, overlays };
+      }
+
+      return { videoWidth: vw, videoHeight: vh };
     }),
   registerClip: (clip) =>
     set((state) => {
@@ -219,10 +271,28 @@ export const useVideoStore = create<VideoState>((set, get) => ({
   setActiveClip: (id) => set({ activeClipId: id }),
   setZoomPercent: (percent) =>
     set((state) => {
-      const clamped = Math.max(0, Math.min(300, percent));
+      const clamped = Math.max(100, Math.min(300, percent));
+      const newZoom = clamped / 100;
+      const oldZoom = state.viewport.zoom || 1;
+      const vw = state.videoWidth || 1;
+      const vh = state.videoHeight || 1;
+
+      // Keep the center of the current viewport stable during zoom
+      const centerX = state.viewport.panX + vw / (2 * oldZoom);
+      const centerY = state.viewport.panY + vh / (2 * oldZoom);
+      let panX = centerX - vw / (2 * newZoom);
+      let panY = centerY - vh / (2 * newZoom);
+
+      // Clamp pan to valid range
+      const maxPanX = Math.max(0, vw - vw / newZoom);
+      const maxPanY = Math.max(0, vh - vh / newZoom);
+      panX = Math.max(0, Math.min(maxPanX, panX));
+      panY = Math.max(0, Math.min(maxPanY, panY));
+
       return {
         zoomPercent: clamped,
-        panOffset: clamped <= 100 ? { x: 0, y: 0 } : state.panOffset,
+        panOffset: { x: -panX, y: -panY },
+        viewport: { zoom: newZoom, panX, panY },
       };
     }),
   setPanOffset: (offset) =>
@@ -232,7 +302,20 @@ export const useVideoStore = create<VideoState>((set, get) => ({
           ? { x: 0, y: 0 }
           : { x: offset.x, y: offset.y },
     })),
-  resetTransform: () => set({ zoomPercent: 100, panOffset: { x: 0, y: 0 } }),
+  setViewport: (partial) =>
+    set((state) => {
+      const next = { ...state.viewport, ...partial };
+      return {
+        viewport: next,
+        zoomPercent: Math.round(next.zoom * 100),
+        panOffset: next.zoom <= 1 ? { x: 0, y: 0 } : { x: -next.panX, y: -next.panY },
+      };
+    }),
+  resetTransform: () => set({
+    zoomPercent: 100,
+    panOffset: { x: 0, y: 0 },
+    viewport: { zoom: 1, panX: 0, panY: 0 },
+  }),
   toggleKeyframeMode: () =>
     set((state) => ({
       keyframeMode: !state.keyframeMode,
