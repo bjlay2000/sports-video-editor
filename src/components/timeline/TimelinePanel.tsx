@@ -177,6 +177,7 @@ export function TimelinePanel() {
   const updateMarker = useAppStore((s) => s.updateMarker);
   const bumpPlayedPercentRefresh = useAppStore((s) => s.bumpPlayedPercentRefresh);
   const players = useAppStore((s) => s.players);
+  const addOpponentPlay = useAppStore((s) => s.addOpponentPlay);
 
   const persistSegmentsToDb = useCallback(async () => {
     await ProjectService.ensureProjectDbOpen();
@@ -487,7 +488,7 @@ export function TimelinePanel() {
   const recentTimelinePlays = markers
     .filter((marker) => marker.event_type !== "HIGHLIGHT" && marker.event_type !== "MARKER")
     .filter((marker) => isTimeWithinSegments(marker.time))
-    .sort((a, b) => b.time - a.time);
+    .sort((a, b) => b.time - a.time || b.id - a.id);
 
   const uniquePlayerNames = useMemo(() => {
     const names = new Set<string>();
@@ -513,6 +514,19 @@ export function TimelinePanel() {
     });
   }, [recentTimelinePlays, filterPlayers, filterStats]);
 
+  const hasActiveFilter = filterPlayers.length > 0 || filterStats.length > 0;
+
+  const filteredMarkers = useMemo(() => {
+    if (!hasActiveFilter) return markers;
+    return markers.filter((m) => {
+      // Always show highlights and manual markers regardless of filter
+      if (m.event_type === "HIGHLIGHT" || m.event_type === "MARKER") return true;
+      if (filterPlayers.length > 0 && !filterPlayers.includes(m.player_name ?? "")) return false;
+      if (filterStats.length > 0 && !filterStats.includes(m.event_type)) return false;
+      return true;
+    });
+  }, [markers, filterPlayers, filterStats, hasActiveFilter]);
+
   const recentRowHeight = 56;
   const recentViewportSafeHeight = Math.max(1, recentViewportHeight);
   const recentOverscanRows = 6;
@@ -522,6 +536,68 @@ export function TimelinePanel() {
     Math.ceil((recentPlaysScrollTop + recentViewportSafeHeight) / recentRowHeight) + recentOverscanRows,
   );
   const visibleRecentTimelinePlays = filteredRecentPlays.slice(recentStartIndex, recentEndIndex);
+
+  const previewClipRef = useRef<{ clips: Array<{ start: number; end: number }>; index: number; rafId: number | null } | null>(null);
+
+  const stopPreview = useCallback(() => {
+    const state = previewClipRef.current;
+    if (state?.rafId != null) cancelAnimationFrame(state.rafId);
+    previewClipRef.current = null;
+    videoEngine.pause();
+    setIsPlaying(false);
+  }, [setIsPlaying]);
+
+  const handlePreviewStats = useCallback(() => {
+    if (!hasActiveFilter || filteredRecentPlays.length === 0) return;
+
+    const clips = filteredRecentPlays
+      .filter((m) => typeof m.start_time === "number" && typeof m.end_time === "number")
+      .map((m) => ({ start: m.start_time!, end: m.end_time! }))
+      .sort((a, b) => a.start - b.start);
+
+    if (clips.length === 0) return;
+
+    // If already previewing, stop
+    if (previewClipRef.current) {
+      stopPreview();
+      return;
+    }
+
+    const state = { clips, index: 0, rafId: null as number | null };
+    previewClipRef.current = state;
+
+    const playNextClip = () => {
+      const s = previewClipRef.current;
+      if (!s || s.index >= s.clips.length) {
+        stopPreview();
+        return;
+      }
+      const clip = s.clips[s.index];
+      videoEngine.seek(clip.start);
+      setCurrentTime(clip.start);
+      setPlayheadTime(clip.start);
+      void videoEngine.play();
+      setIsPlaying(true);
+
+      const watchEnd = () => {
+        const cur = previewClipRef.current;
+        if (!cur) return;
+        const t = videoEngine.getCurrentTime();
+        if (t >= cur.clips[cur.index].end) {
+          cur.index += 1;
+          playNextClip();
+          return;
+        }
+        cur.rafId = requestAnimationFrame(watchEnd);
+      };
+      state.rafId = requestAnimationFrame(watchEnd);
+    };
+
+    playNextClip();
+  }, [hasActiveFilter, filteredRecentPlays, stopPreview, setCurrentTime, setPlayheadTime, setIsPlaying]);
+
+  // Clean up preview on unmount
+  useEffect(() => () => { stopPreview(); }, [stopPreview]);
 
   const handleDeleteSelected = async () => {
     if (selectedSegmentId) {
@@ -870,6 +946,16 @@ export function TimelinePanel() {
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2 ml-auto">
+          {hasActiveFilter && filteredRecentPlays.length > 0 && (
+            <button
+              type="button"
+              onClick={handlePreviewStats}
+              className="px-2 py-1 rounded text-[11px] transition-colors border bg-panel border-panel-border hover:bg-panel-border text-gray-300 hover:text-accent"
+              title="Preview Stats"
+            >
+              {previewClipRef.current ? "⏹" : "▶"}
+            </button>
+          )}
           {/* Player filter */}
           <div className="relative">
             <button
@@ -954,7 +1040,7 @@ export function TimelinePanel() {
               projectPlayhead={projectPlayhead}
               projectDuration={projectDuration}
               duration={duration}
-              markers={markers}
+              markers={filteredMarkers}
               thumbnails={thumbnails}
               assetsLoading={assetsLoading}
               thumbnailsGenerating={thumbnailsGenerating}
@@ -982,7 +1068,7 @@ export function TimelinePanel() {
         <aside className="relative z-20 w-72 min-w-72 border-l border-panel-border bg-surface px-4 py-4 flex flex-col gap-3 min-h-0">
           <div className="flex items-center justify-between text-[11px] uppercase tracking-[0.25em] text-gray-500">
             <span>Recent Plays</span>
-            <span className="text-[10px] text-gray-600">{filteredRecentPlays.length}{filterPlayers.length > 0 || filterStats.length > 0 ? ` / ${recentTimelinePlays.length}` : ""}</span>
+            <span className="text-[10px] text-gray-600">{filteredRecentPlays.length}{hasActiveFilter ? ` / ${recentTimelinePlays.length}` : ""}</span>
           </div>
           <div
             ref={recentListRef}
@@ -1107,6 +1193,25 @@ export function TimelinePanel() {
                                   #{p.number} {p.name}
                                 </button>
                               ))}
+                            </div>
+                            <div className="border-t border-panel-border mt-1 pt-1">
+                              <button
+                                className="w-full text-center text-[11px] px-2 py-1 rounded transition-colors hover:bg-red-900/40 text-red-400"
+                                onClick={async () => {
+                                  await ProjectService.ensureProjectDbOpen();
+                                  const timestamp = marker.time;
+                                  const eventType = marker.event_type;
+                                  // Remove the home play (updates score, markers, db)
+                                  await PlayCoordinator.removePlays([marker.id]);
+                                  // Record as opponent stat
+                                  const result = await DatabaseService.addOpponentStat(timestamp, eventType);
+                                  addOpponentPlay({ id: result.id, timestamp: result.timestamp, event_type: result.event_type });
+                                  setEditingMarkerId(null);
+                                  setEditMode(null);
+                                }}
+                              >
+                                Opponent
+                              </button>
                             </div>
                           </div>
                         )}

@@ -128,6 +128,8 @@ export function ScoringPanel() {
   const showScoreboardOverlay = useVideoStore((s) => s.showScoreboardOverlay);
   const toggleScoreboardOverlay = useVideoStore((s) => s.toggleScoreboardOverlay);
   const segments = useTimelineStore((s) => s.segments);
+  const setPlayheadTime = useTimelineStore((s) => s.setPlayheadTime);
+  const setCurrentTime = useVideoStore((s) => s.setCurrentTime);
   const isPlaying = useVideoStore((s) => s.isPlaying);
   const setIsPlaying = useVideoStore((s) => s.setIsPlaying);
   const [showStatsDrawer, setShowStatsDrawer] = useState(false);
@@ -673,15 +675,18 @@ export function ScoringPanel() {
 
         {/* Controls — always docked at the bottom of the scoreboard section */}
         <div className="pt-3 flex flex-col gap-2">
-          <div className="flex justify-center items-center gap-3 group/transport">
+          <div className="flex justify-center items-center gap-3">
             <button
               type="button"
               onClick={() => {
                 if (!videoSrc) return;
-                videoEngine.seek(Math.max(0, currentTime - 5));
+                const newTime = Math.max(0, currentTime - 5);
+                videoEngine.seek(newTime);
+                setCurrentTime(newTime);
+                setPlayheadTime(newTime);
               }}
               disabled={!videoSrc}
-              className="text-gray-500 hover:text-accent text-lg leading-none transition-all opacity-0 group-hover/transport:opacity-100 disabled:opacity-0 disabled:cursor-not-allowed"
+              className="text-gray-500 hover:text-accent text-lg leading-none transition-all disabled:opacity-30 disabled:cursor-not-allowed"
               title="Back 5 sec"
             >
               <span className="inline-block -rotate-90">↺</span>
@@ -699,10 +704,13 @@ export function ScoringPanel() {
               type="button"
               onClick={() => {
                 if (!videoSrc) return;
-                videoEngine.seek(Math.min(duration, currentTime + 5));
+                const newTime = Math.min(duration, currentTime + 5);
+                videoEngine.seek(newTime);
+                setCurrentTime(newTime);
+                setPlayheadTime(newTime);
               }}
               disabled={!videoSrc}
-              className="text-gray-500 hover:text-accent text-lg leading-none transition-all opacity-0 group-hover/transport:opacity-100 disabled:opacity-0 disabled:cursor-not-allowed"
+              className="text-gray-500 hover:text-accent text-lg leading-none transition-all disabled:opacity-30 disabled:cursor-not-allowed"
               title="Forward 5 sec"
             >
               <span className="inline-block rotate-90">↻</span>

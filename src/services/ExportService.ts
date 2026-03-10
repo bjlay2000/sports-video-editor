@@ -353,7 +353,7 @@ export function mergeOverlappingSegments(
         end = targetEnd;
       }
 
-      return { start_time: start, end_time: end };
+      return { start_time: start, end_time: end, label: clip.label };
     })
     .filter((clip) => clip.end_time - clip.start_time > 0.05)
     .sort((a, b) => a.start_time - b.start_time || a.end_time - b.end_time);
@@ -370,6 +370,8 @@ export function mergeOverlappingSegments(
 
     if (clip.start_time <= last.end_time + epsilon) {
       last.end_time = Math.max(last.end_time, clip.end_time);
+      // When merging clips, keep the first label (or the non-empty one)
+      if (!last.label && clip.label) last.label = clip.label;
     } else {
       merged.push({ ...clip });
     }

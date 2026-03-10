@@ -6,6 +6,10 @@ import { ExportService } from "../../services/ExportService";
 import { logExportEvent } from "../../services/ExportLogService";
 import { StatType } from "../../store/types";
 import { save } from "@tauri-apps/plugin-dialog";
+import { getRenderState } from "../../engine/RenderEngine";
+import { renderFrame } from "../../engine/CanvasCompositor";
+import { deriveScoreEvents } from "../../engine/scoreEvents";
+import type { TimelineModel } from "../../engine/types";
 
 const ALL_STAT_TYPES: StatType[] = [
   "2PT", "3PT", "FT", "AST", "REB", "STL", "BLK", "TO", "FOUL",
@@ -15,10 +19,12 @@ export function HighlightExportModal() {
   const [step, setStep] = useState<"players" | "stats">("players");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [selectedPlayers, setSelectedPlayers] = useState<Set<number>>(new Set());
+  const [includeManualHighlights, setIncludeManualHighlights] = useState(false);
   const [exporting, setExporting] = useState(false);
   const setShowHighlightModal = useAppStore((s) => s.setShowHighlightModal);
   const players = useAppStore((s) => s.players);
   const plays = useAppStore((s) => s.plays);
+  const markers = useAppStore((s) => s.markers);
   const setIsExporting = useAppStore((s) => s.setIsExporting);
   const setExportProgressVisible = useAppStore((s) => s.setExportProgressVisible);
   const updateExportProgress = useAppStore((s) => s.updateExportProgress);
@@ -75,9 +81,31 @@ export function HighlightExportModal() {
     if (!ctx) return;
 
     await new Promise<void>((resolve) => {
-      window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(async () => {
         try {
           ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+
+          // Render overlays on top if scoreboard overlay is enabled
+          const videoState = useVideoStore.getState();
+          if (videoState.showScoreboardOverlay) {
+            const appState = useAppStore.getState();
+            const overlayList = videoState.overlays ?? [];
+            const scoreEvts = deriveScoreEvents(
+              appState.plays,
+              appState.opponentScoreEvents,
+              appState.homeScoreEvents,
+            );
+            const model: TimelineModel = {
+              duration: videoState.duration || 0,
+              currentTime: videoEl.currentTime,
+              overlays: overlayList,
+              scoreEvents: scoreEvts,
+              videoTrack: { keyframes: [{ time: 0, scale: 1, x: 0, y: 0 }] },
+            };
+            const rs = getRenderState(model, videoEl.currentTime);
+            await renderFrame(ctx, rs, canvas.width, canvas.height);
+          }
+
           setExportThumbnailUrl(canvas.toDataURL("image/jpeg", 0.65));
           state.lastUpdateAt = now;
           if (Number.isFinite(frame) && frame > 0) {
@@ -130,7 +158,7 @@ export function HighlightExportModal() {
 
   const handleExport = async () => {
     logExportEvent("HighlightExportModal", "handleExport: click");
-    if (selected.size === 0 || !videoPath) {
+    if ((selected.size === 0 && !includeManualHighlights) || !videoPath) {
       logExportEvent("HighlightExportModal", "handleExport: aborted (no selected stats or videoPath)");
       return;
     }
@@ -172,11 +200,34 @@ export function HighlightExportModal() {
     setExportProgressVisible(true, "Exporting Highlights");
     let completed = false;
     try {
+      const STAT_LABEL_MAP: Record<string, string> = {
+        "2PT": "2pt",
+        "3PT": "3pt",
+        "FT": "FT",
+        "REB": "REB",
+        "AST": "AST",
+        "STL": "STL",
+        "BLK": "BLK",
+      };
+
       const selectedPlayerIds = new Set(selectedPlayers);
-      const clips = plays
+      const statClips = plays
         .filter((play) => selectedPlayerIds.has(play.player_id) && selected.has(play.event_type as StatType))
         .sort((a, b) => a.start_time - b.start_time)
-        .map((p) => ({ start_time: p.start_time, end_time: p.end_time }));
+        .map((p) => ({
+          start_time: p.start_time,
+          end_time: p.end_time,
+          label: STAT_LABEL_MAP[p.event_type] ?? "",
+        }));
+
+      const manualClips = includeManualHighlights
+        ? markers
+            .filter((m) => m.event_type === "HIGHLIGHT" && typeof m.start_time === "number" && typeof m.end_time === "number")
+            .sort((a, b) => a.start_time! - b.start_time!)
+            .map((m) => ({ start_time: m.start_time!, end_time: m.end_time!, label: "" }))
+        : [];
+
+      const clips = [...statClips, ...manualClips].sort((a, b) => a.start_time - b.start_time);
 
       if (clips.length === 0) {
         logExportEvent("HighlightExportModal", "handleExport: aborted (no clips matched filters)");
@@ -354,6 +405,15 @@ export function HighlightExportModal() {
                 </label>
               ))}
             </div>
+            <label className="flex items-center justify-between px-3 py-1.5 bg-surface rounded border border-panel-border mb-4 cursor-pointer hover:bg-surface-light transition-colors">
+              <span className="text-sm text-white">Manual Highlights</span>
+              <input
+                type="checkbox"
+                checked={includeManualHighlights}
+                onChange={() => setIncludeManualHighlights((prev) => !prev)}
+                className="accent-accent"
+              />
+            </label>
             <label
               className="flex items-center justify-between text-xs text-gray-400 mb-3"
             >
@@ -368,7 +428,7 @@ export function HighlightExportModal() {
             </label>
             <button
               onClick={handleExport}
-              disabled={selected.size === 0 || selectedPlayers.size === 0 || exporting}
+              disabled={(selected.size === 0 && !includeManualHighlights) || (selected.size > 0 && selectedPlayers.size === 0) || exporting}
               className="w-full py-2 bg-accent hover:bg-accent-hover text-white rounded text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {exporting ? "Exporting..." : "Export Selected"}

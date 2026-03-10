@@ -20,6 +20,10 @@ import { PlayCoordinator } from "../services/PlayCoordinator";
 import { ProjectService } from "../services/ProjectService";
 import { DatabaseService } from "../services/DatabaseService";
 import { logExportEvent } from "../services/ExportLogService";
+import { getRenderState } from "../engine/RenderEngine";
+import { renderFrame } from "../engine/CanvasCompositor";
+import { deriveScoreEvents } from "../engine/scoreEvents";
+import type { TimelineModel } from "../engine/types";
 
 export function Toolbar() {
   const [confirmAction, setConfirmAction] = useState<null | "clear-tags" | "clear-highlights" | "new-game">(null);
@@ -110,9 +114,31 @@ export function Toolbar() {
     if (!ctx) return;
 
     await new Promise<void>((resolve) => {
-      window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(async () => {
         try {
           ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+
+          // Render overlays on top if scoreboard overlay is enabled
+          const videoState = useVideoStore.getState();
+          if (videoState.showScoreboardOverlay) {
+            const appState = useAppStore.getState();
+            const overlays = videoState.overlays ?? [];
+            const scoreEvents = deriveScoreEvents(
+              appState.plays,
+              appState.opponentScoreEvents,
+              appState.homeScoreEvents,
+            );
+            const model: TimelineModel = {
+              duration: videoState.duration || 0,
+              currentTime: videoEl.currentTime,
+              overlays,
+              scoreEvents,
+              videoTrack: { keyframes: [{ time: 0, scale: 1, x: 0, y: 0 }] },
+            };
+            const rs = getRenderState(model, videoEl.currentTime);
+            await renderFrame(ctx, rs, canvas.width, canvas.height);
+          }
+
           setExportThumbnailUrl(canvas.toDataURL("image/jpeg", 0.65));
           state.lastUpdateAt = now;
           if (Number.isFinite(frame) && frame > 0) {

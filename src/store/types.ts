@@ -60,6 +60,7 @@ export interface OpponentPlay {
 export interface ClipRange {
   start_time: number;
   end_time: number;
+  label?: string;
 }
 
 export interface TimelineMarker {

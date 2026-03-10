@@ -430,7 +430,7 @@ export function TimelineRenderer({
       key={`block-${entry.marker.id}`}
       data-marker-block
       className={`group absolute flex items-center gap-2 rounded-md border-2 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-black/80 shadow-[inset_0_0_6px_rgba(0,0,0,0.25)] ${
-        entry.selected ? "ring-2 ring-purple-400/80" : ""
+        entry.selected ? "ring-1 ring-purple-400/80" : ""
       }`}
       style={{
         left: entry.projectStart * pixelsPerSecond,

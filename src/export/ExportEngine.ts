@@ -57,6 +57,7 @@ export function getExportLog() {
 interface ClipRange {
   start_time: number;
   end_time: number;
+  label?: string;
 }
 
 /* ================================================================
@@ -125,6 +126,7 @@ export interface ExportResult {
 interface HighlightSegment {
   start: number;
   end: number;
+  label?: string;
 }
 
 function formatSec(value: number): string {
@@ -158,6 +160,7 @@ function buildSegmentArgs(params: {
   fps: number;
   encoder: ResolvedEncoder;
   outputPath: string;
+  statLabel?: string;
 }): string[] {
   const {
     videoPath,
@@ -168,28 +171,38 @@ function buildSegmentArgs(params: {
     fps,
     encoder,
     outputPath,
+    statLabel,
   } = params;
 
   const isQsvEncoder = encoder.name.endsWith("_qsv");
-  const codecArgs = applyQsvSegmentTunables(encoder.codecArgs, isQsvEncoder);
+  const hasStatLabel = Boolean(statLabel && statLabel.trim().length > 0);
+  const forceSoftwareTextPath = isQsvEncoder && hasStatLabel;
+  const codecArgs = forceSoftwareTextPath
+    ? ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22"]
+    : applyQsvSegmentTunables(encoder.codecArgs, isQsvEncoder);
 
   const args: string[] = ["-y"];
 
   args.push("-ss", formatSec(startSec));
   args.push("-t", formatSec(durationSec));
 
-  if (isQsvEncoder) {
+  if (isQsvEncoder && !forceSoftwareTextPath) {
     args.push("-hwaccel", "qsv", "-hwaccel_output_format", "qsv");
-  } else if (encoder.hwaccelArgs.length > 0) {
+  } else if (!forceSoftwareTextPath && encoder.hwaccelArgs.length > 0) {
     args.push(...encoder.hwaccelArgs);
   }
 
   args.push("-i", videoPath);
 
-  if (isQsvEncoder) {
+  // Build video filter chain
+  const drawTextFilter = hasStatLabel
+    ? `,drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':text='${statLabel!.replace(/'/g, "\\'")}':fontsize=${Math.max(12, Math.round(exportHeight * 0.024))}:fontcolor=white@0.45:borderw=1:bordercolor=black@0.25:x=w-tw-14:y=14`
+    : "";
+
+  if (isQsvEncoder && !forceSoftwareTextPath) {
     args.push("-vf", `scale_qsv=w=${exportWidth}:h=${exportHeight}:format=nv12`);
   } else {
-    args.push("-vf", `scale=${exportWidth}:${exportHeight}:flags=lanczos`);
+    args.push("-vf", `scale=${exportWidth}:${exportHeight}:flags=lanczos${drawTextFilter}`);
     args.push("-pix_fmt", "yuv420p");
   }
 
@@ -266,6 +279,7 @@ export async function runHighlightExportSegmented(config: ExportConfig): Promise
     const segmentSpecs: HighlightSegment[] = clips.map((clip) => ({
       start: clip.start_time,
       end: clip.end_time,
+      label: clip.label,
     }));
 
     exportLog(`runHighlightExportSegmented: encoding ${segmentSpecs.length} segments`);
@@ -303,6 +317,7 @@ export async function runHighlightExportSegmented(config: ExportConfig): Promise
           fps,
           encoder,
           outputPath: segmentPath,
+          statLabel: segment.label,
         }),
         {
           onProgress: (payload) => {
