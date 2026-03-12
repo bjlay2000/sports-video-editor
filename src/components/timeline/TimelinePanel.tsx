@@ -128,7 +128,6 @@ export function TimelinePanel() {
   const lastVideoPathRef = useRef<string | null>(null);
 
   const pixelsPerSecond = useTimelineStore((s) => s.pixelsPerSecond);
-  const setPixelsPerSecond = useTimelineStore((s) => s.setPixelsPerSecond);
   const scrollX = useTimelineStore((s) => s.scrollX);
   const setScrollX = useTimelineStore((s) => s.setScrollX);
   const playheadTime = useTimelineStore((s) => s.playheadTime);
@@ -247,16 +246,33 @@ export function TimelinePanel() {
 
   const handleWheel = useCallback(
     (e: ReactWheelEvent<HTMLDivElement>) => {
+      const scroller = scrollRef.current;
+      if (!scroller) return;
+
       if (e.ctrlKey || e.metaKey) {
         e.preventDefault();
-        const delta = e.deltaY > 0 ? -1 : 1;
-        const factor = 1 + delta * 0.15;
-        setPixelsPerSecond(pixelsPerSecond * factor);
+        const rect = scroller.getBoundingClientRect();
+        const pointerXInViewport = e.clientX - rect.left;
+        const pointerTimelineX = pointerXInViewport + scroller.scrollLeft;
+        const anchorTime = pixelsPerSecond > 0 ? pointerTimelineX / pixelsPerSecond : 0;
+
+        if (e.deltaY < 0) {
+          zoomIn();
+        } else {
+          zoomOut();
+        }
+
+        requestAnimationFrame(() => {
+          const nextPps = useTimelineStore.getState().pixelsPerSecond;
+          const nextLeft = Math.max(0, anchorTime * nextPps - pointerXInViewport);
+          scroller.scrollLeft = nextLeft;
+          setScrollX(nextLeft);
+        });
       } else {
         setScrollX(Math.max(0, scrollX + e.deltaY + e.deltaX));
       }
     },
-    [pixelsPerSecond, scrollX, setPixelsPerSecond, setScrollX]
+    [pixelsPerSecond, scrollX, setScrollX, zoomIn, zoomOut]
   );
 
   const handleScroll = (e: ReactUIEvent<HTMLDivElement>) => {
@@ -387,10 +403,10 @@ export function TimelinePanel() {
         : marker.time;
     const anchor = isTimeWithinSegments(preferredStart) ? preferredStart : marker.time;
     const projectTime = sourceToProject(anchor);
-    handleSelectMarker(marker.id, false);
+    setSelectedMarkerIds([marker.id]);
     handleSeek(projectTime);
     requestAnimationFrame(() => {
-      handleCenterOnPlayhead();
+      centerOnProjectTime(projectTime);
     });
   };
 
@@ -681,7 +697,16 @@ export function TimelinePanel() {
 
   const handleAddCutPoint = () => {
     if (!segments.length) return;
-    splitSegment(playheadTime);
+    const epsilon = 0.05;
+    const sourceFromPlayhead = playheadTime;
+    const isWithinCurrentSegments = segments.some(
+      (segment) =>
+        sourceFromPlayhead > segment.start + epsilon &&
+        sourceFromPlayhead < segment.end - epsilon
+    );
+    const fallbackSource = projectToSource(projectPlayhead);
+    const cutTime = isWithinCurrentSegments ? sourceFromPlayhead : fallbackSource;
+    splitSegment(cutTime);
     void persistSegmentsToDb();
   };
 
@@ -720,16 +745,20 @@ export function TimelinePanel() {
     }
   }, [segments, currentTime, duration, isPlaying, setCurrentTime, setPlayheadTime, setIsPlaying]);
 
-  const handleCenterOnPlayhead = () => {
+  const centerOnProjectTime = (projectTime: number) => {
     if (!scrollRef.current) return;
     const scrollWidth = scrollRef.current.scrollWidth;
     const timelineDur = projectDuration || duration || 1;
-    const centerRatio = playheadTime / timelineDur;
+    const centerRatio = projectTime / timelineDur;
     const target = centerRatio * scrollWidth;
     const offset = target - containerWidth / 2;
     const clamped = Math.max(0, Math.min(offset, scrollWidth - containerWidth));
     scrollRef.current.scrollTo({ left: clamped, behavior: "smooth" });
     setScrollX(clamped);
+  };
+
+  const handleCenterOnPlayhead = () => {
+    centerOnProjectTime(projectPlayhead);
   };
 
   const handlePlayheadDragStart = useCallback(() => {
@@ -1062,6 +1091,7 @@ export function TimelinePanel() {
               onPlayheadDragStart={handlePlayheadDragStart}
               onPlayheadDragMove={handlePlayheadDragMove}
               onPlayheadDragEnd={handlePlayheadDragEnd}
+              onCenterOnTime={centerOnProjectTime}
             />
           </div>
         </div>

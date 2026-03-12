@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { confirm, save } from "@tauri-apps/plugin-dialog";
 import { writeFile } from "@tauri-apps/plugin-fs";
 import { useAppStore } from "../../store/appStore";
@@ -138,6 +139,8 @@ export function ScoringPanel() {
   const [playedPercentages, setPlayedPercentages] = useState<PlayerPlayedPercentage[]>([]);
   const [rosters, setRosters] = useState<Array<{ roster_id: number; name: string }>>([]);
   const [selectedRosterId, setSelectedRosterId] = useState<string>("");
+  const [lastExportPath, setLastExportPath] = useState<string | null>(null);
+  const [downloadActionBusy, setDownloadActionBusy] = useState<"open" | "reveal" | null>(null);
   const gameResetVersion = useAppStore((s) => s.gameResetVersion);
 
   // Fetch DB-derived played % from backend only
@@ -396,8 +399,15 @@ export function ScoringPanel() {
     return { shots, others, points };
   }, [opponentPlays]);
 
+  const hasStatsOrBoxScore = statRows.length > 0 || opponentPlays.length > 0;
+  const exportedFileName = useMemo(() => {
+    if (!lastExportPath) return "";
+    const parts = lastExportPath.split(/[\\/]/);
+    return parts[parts.length - 1] || lastExportPath;
+  }, [lastExportPath]);
+
   const handleExportStatsCsv = useCallback(async () => {
-    if (statRows.length === 0) return;
+    if (!hasStatsOrBoxScore) return;
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const outputPath = await save({
@@ -417,20 +427,23 @@ export function ScoringPanel() {
     ];
 
     const lines: string[] = [];
+    lines.push("Player Stats");
     lines.push(columns.map(csvEscape).join(","));
 
-    for (const row of statRows) {
-      lines.push([
-        csvEscape(`#${row.player.number} ${row.player.name}`),
-        csvEscape(row.points),
-        csvEscape(`${row.percentPlayed.toFixed(1)}%`),
-        ...SHOT_TYPES.map((shot) => {
-          const d = row.shots[shot.key];
-          const attempts = d.makes + d.misses;
-          return csvEscape(attempts > 0 ? `${d.makes}/${attempts}` : "-");
-        }),
-        ...OTHER_STATS.map((stat) => csvEscape(row.others[stat] ?? "-")),
-      ].join(","));
+    if (statRows.length > 0) {
+      for (const row of statRows) {
+        lines.push([
+          csvEscape(`#${row.player.number} ${row.player.name}`),
+          csvEscape(row.points),
+          csvEscape(`${row.percentPlayed.toFixed(1)}%`),
+          ...SHOT_TYPES.map((shot) => {
+            const d = row.shots[shot.key];
+            const attempts = d.makes + d.misses;
+            return csvEscape(attempts > 0 ? `${d.makes}/${attempts}` : "-");
+          }),
+          ...OTHER_STATS.map((stat) => csvEscape(row.others[stat] ?? "-")),
+        ].join(","));
+      }
     }
 
     lines.push([
@@ -445,13 +458,211 @@ export function ScoringPanel() {
       ...OTHER_STATS.map((stat) => csvEscape(teamTotals.others[stat] ?? "-")),
     ].join(","));
 
+    lines.push("");
+    lines.push("Box Score");
+    lines.push([
+      csvEscape("Team"),
+      csvEscape("PTS"),
+      ...SHOT_TYPES.map((shot) => csvEscape(`${shot.label} (M/A)`)),
+      ...OTHER_STATS.map((stat) => csvEscape(stat)),
+    ].join(","));
+
+    lines.push([
+      csvEscape("Home"),
+      csvEscape(teamTotals.points),
+      ...SHOT_TYPES.map((shot) => {
+        const d = teamTotals.shots[shot.key];
+        const attempts = d.makes + d.misses;
+        return csvEscape(attempts > 0 ? `${d.makes}/${attempts}` : "-");
+      }),
+      ...OTHER_STATS.map((stat) => csvEscape(teamTotals.others[stat] ?? "-")),
+    ].join(","));
+
+    lines.push([
+      csvEscape("Opponent"),
+      csvEscape(opponentTotals.points),
+      ...SHOT_TYPES.map((shot) => {
+        const d = opponentTotals.shots[shot.key];
+        const attempts = d.makes + d.misses;
+        return csvEscape(attempts > 0 ? `${d.makes}/${attempts}` : "-");
+      }),
+      ...OTHER_STATS.map((stat) => csvEscape(opponentTotals.others[stat] ?? "-")),
+    ].join(","));
+
     try {
       setExportingStats(true);
       await writeFile(normalizedPath, new TextEncoder().encode(lines.join("\n")));
+      setLastExportPath(normalizedPath);
     } finally {
       setExportingStats(false);
     }
-  }, [statRows, teamTotals]);
+  }, [hasStatsOrBoxScore, statRows, teamTotals, opponentTotals]);
+
+  const handleOpenExportedFile = useCallback(async () => {
+    if (!lastExportPath) return;
+    try {
+      setDownloadActionBusy("open");
+      await invoke("open_file_path", { path: lastExportPath });
+    } catch (error) {
+      console.error("Failed to open exported file", error);
+    } finally {
+      setDownloadActionBusy(null);
+    }
+  }, [lastExportPath]);
+
+  const handleRevealExportedFile = useCallback(async () => {
+    if (!lastExportPath) return;
+    try {
+      setDownloadActionBusy("reveal");
+      await invoke("reveal_file_in_folder", { path: lastExportPath });
+    } catch (error) {
+      console.error("Failed to reveal exported file", error);
+    } finally {
+      setDownloadActionBusy(null);
+    }
+  }, [lastExportPath]);
+
+  const handlePrintStats = useCallback(() => {
+    if (!hasStatsOrBoxScore) return;
+
+    const columns = [
+      "Player",
+      "PTS",
+      "% Played",
+      ...SHOT_TYPES.map((shot) => `${shot.label} (M/A)`),
+      ...OTHER_STATS,
+    ];
+
+    const rowsHtml = statRows
+      .map((row) => {
+        const shotCells = SHOT_TYPES.map((shot) => {
+          const d = row.shots[shot.key];
+          const attempts = d.makes + d.misses;
+          return `<td>${attempts > 0 ? `${d.makes}/${attempts}` : "-"}</td>`;
+        }).join("");
+
+        const otherCells = OTHER_STATS.map((stat) => `<td>${row.others[stat] ?? "-"}</td>`).join("");
+
+        return `<tr><td>#${row.player.number} ${row.player.name}</td><td>${row.points}</td><td>${row.percentPlayed.toFixed(1)}%</td>${shotCells}${otherCells}</tr>`;
+      })
+      .join("");
+
+    const totalShotCells = SHOT_TYPES.map((shot) => {
+      const d = teamTotals.shots[shot.key];
+      const attempts = d.makes + d.misses;
+      return `<td>${attempts > 0 ? `${d.makes}/${attempts}` : "-"}</td>`;
+    }).join("");
+
+    const totalOtherCells = OTHER_STATS.map((stat) => `<td>${teamTotals.others[stat] ?? "-"}</td>`).join("");
+
+    const boxColumns = [
+      "Team",
+      "PTS",
+      ...SHOT_TYPES.map((shot) => `${shot.label} (M/A)`),
+      ...OTHER_STATS,
+    ];
+
+    const homeBoxCells = [
+      `<td>Home</td>`,
+      `<td>${teamTotals.points}</td>`,
+      ...SHOT_TYPES.map((shot) => {
+        const d = teamTotals.shots[shot.key];
+        const attempts = d.makes + d.misses;
+        return `<td>${attempts > 0 ? `${d.makes}/${attempts}` : "-"}</td>`;
+      }),
+      ...OTHER_STATS.map((stat) => `<td>${teamTotals.others[stat] ?? "-"}</td>`),
+    ].join("");
+
+    const opponentBoxCells = [
+      `<td>Opponent</td>`,
+      `<td>${opponentTotals.points}</td>`,
+      ...SHOT_TYPES.map((shot) => {
+        const d = opponentTotals.shots[shot.key];
+        const attempts = d.makes + d.misses;
+        return `<td>${attempts > 0 ? `${d.makes}/${attempts}` : "-"}</td>`;
+      }),
+      ...OTHER_STATS.map((stat) => `<td>${opponentTotals.others[stat] ?? "-"}</td>`),
+    ].join("");
+
+    const iframe = document.createElement("iframe");
+    iframe.setAttribute("aria-hidden", "true");
+    iframe.style.position = "fixed";
+    iframe.style.right = "0";
+    iframe.style.bottom = "0";
+    iframe.style.width = "0";
+    iframe.style.height = "0";
+    iframe.style.border = "0";
+    document.body.appendChild(iframe);
+
+    const printDoc = iframe.contentDocument;
+    const printWindow = iframe.contentWindow;
+    if (!printDoc || !printWindow) {
+      document.body.removeChild(iframe);
+      return;
+    }
+
+    printDoc.open();
+    printDoc.write(`
+      <html>
+        <head>
+          <title>Game Stats</title>
+          <style>
+            body { font-family: Segoe UI, Arial, sans-serif; margin: 24px; color: #111827; }
+            h1 { margin: 0 0 12px; font-size: 20px; }
+            table { width: 100%; border-collapse: collapse; font-size: 12px; }
+            th, td { border: 1px solid #d1d5db; padding: 6px 8px; text-align: right; }
+            th:first-child, td:first-child { text-align: left; }
+            thead th { background: #f3f4f6; }
+            tfoot td { font-weight: 700; background: #f9fafb; }
+          </style>
+        </head>
+        <body>
+          <h1>Game Stats</h1>
+          <table>
+            <thead>
+              <tr>${columns.map((col) => `<th>${col}</th>`).join("")}</tr>
+            </thead>
+            <tbody>
+              ${rowsHtml}
+            </tbody>
+            <tfoot>
+              <tr>
+                <td>Team Total</td>
+                <td>${teamTotals.points}</td>
+                <td>${teamTotals.teamPlayedPercent.toFixed(1)}%</td>
+                ${totalShotCells}
+                ${totalOtherCells}
+              </tr>
+            </tfoot>
+          </table>
+          <h1 style="margin-top: 20px;">Box Score</h1>
+          <table>
+            <thead>
+              <tr>${boxColumns.map((col) => `<th>${col}</th>`).join("")}</tr>
+            </thead>
+            <tbody>
+              <tr>${homeBoxCells}</tr>
+              <tr>${opponentBoxCells}</tr>
+            </tbody>
+          </table>
+        </body>
+      </html>
+    `);
+    printDoc.close();
+
+    const cleanup = () => {
+      if (iframe.parentNode) {
+        iframe.parentNode.removeChild(iframe);
+      }
+    };
+
+    printWindow.addEventListener("afterprint", cleanup, { once: true });
+    setTimeout(() => {
+      printWindow.focus();
+      printWindow.print();
+    }, 50);
+    setTimeout(cleanup, 1500);
+  }, [hasStatsOrBoxScore, statRows, teamTotals, opponentTotals]);
 
   return (
     <div id="scoring-panel" className="relative h-full flex flex-col bg-panel overflow-hidden">
@@ -515,24 +726,65 @@ export function ScoringPanel() {
             <h4 className="text-xs font-semibold text-gray-300 uppercase tracking-wider">
               Game Stats
             </h4>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                title="Export Stats CSV"
-                onClick={handleExportStatsCsv}
-                disabled={exportingStats || statRows.length === 0}
-                className="rounded px-2 py-1 text-xs text-gray-300 hover:bg-panel-border disabled:opacity-40 disabled:cursor-not-allowed"
-              >
-                ⤓
-              </button>
-              <button
-                type="button"
-                onClick={() => setShowStatsDrawer(false)}
-                className="rounded px-2 py-1 text-xs text-gray-400 hover:text-white hover:bg-panel-border transition-colors"
-                title="Close"
-              >
-                ✕
-              </button>
+            <div className="flex flex-col items-end gap-1.5">
+              {lastExportPath && (
+                <div className="flex max-w-[360px] items-center gap-2 rounded border border-panel-border bg-[#0f1118] px-2 py-1 text-[11px]">
+                  <button
+                    type="button"
+                    onClick={handleOpenExportedFile}
+                    disabled={downloadActionBusy !== null}
+                    className="truncate text-accent hover:underline disabled:opacity-50 disabled:no-underline"
+                    title={lastExportPath}
+                  >
+                    {exportedFileName}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleRevealExportedFile}
+                    disabled={downloadActionBusy !== null}
+                    className="whitespace-nowrap text-gray-300 hover:text-white disabled:opacity-50"
+                  >
+                    Show Folder
+                  </button>
+                </div>
+              )}
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  title="Export Stats CSV"
+                  onClick={handleExportStatsCsv}
+                  disabled={exportingStats || !hasStatsOrBoxScore}
+                  className="rounded p-2 text-gray-300 hover:bg-panel-border disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <path d="M12 3v11" />
+                    <path d="m7 10 5 5 5-5" />
+                    <path d="M4 20h16" />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  title="Print Stats"
+                  onClick={handlePrintStats}
+                  disabled={!hasStatsOrBoxScore}
+                  className="rounded p-2 text-gray-300 hover:bg-panel-border disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <rect x="6" y="3" width="12" height="6" rx="1" />
+                    <rect x="6" y="14" width="12" height="7" rx="1" />
+                    <path d="M4 10h16a1 1 0 0 1 1 1v4h-3" />
+                    <path d="M3 15v-4a1 1 0 0 1 1-1" />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowStatsDrawer(false)}
+                  className="rounded px-2 py-1 text-xs text-gray-400 hover:text-white hover:bg-panel-border transition-colors"
+                  title="Close"
+                >
+                  ✕
+                </button>
+              </div>
             </div>
           </div>
           <div className="flex-1 overflow-auto p-3">

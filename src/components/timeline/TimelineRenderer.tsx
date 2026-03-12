@@ -71,6 +71,7 @@ interface Props {
   onPlayheadDragStart: () => void;
   onPlayheadDragMove: (clientX: number) => void;
   onPlayheadDragEnd: () => void;
+  onCenterOnTime: (projectTime: number) => void;
 }
 
 const formatTime = (seconds: number) => {
@@ -144,7 +145,9 @@ export function TimelineRenderer({
   onPlayheadDragStart,
   onPlayheadDragMove,
   onPlayheadDragEnd,
+  onCenterOnTime,
 }: Props) {
+  const TRACK_INSET_PX = 12;
   const scrubRef = useRef<HTMLDivElement>(null);
   const draggingRef = useRef(false);
   const resizingRef = useRef<{ markerId: number; edge: "start" | "end" } | null>(null);
@@ -267,8 +270,9 @@ export function TimelineRenderer({
       }
       const projectStart = sourceToProject(hitSegment.start);
       onSeek(projectStart);
+      onCenterOnTime(projectStart);
     },
-    [getTimeFromPointer, projectToSource, segments, sourceToProject, onSeek]
+    [getTimeFromPointer, projectToSource, segments, sourceToProject, onSeek, onCenterOnTime]
   );
 
   useEffect(() => {
@@ -651,13 +655,13 @@ export function TimelineRenderer({
         <div className="pointer-events-none absolute inset-0" aria-hidden="true">
           <div
             className="absolute top-0 bottom-0 w-px rounded bg-[#fcd34d]"
-            style={{ left: playheadX }}
+            style={{ left: playheadX + TRACK_INSET_PX }}
           />
         </div>
-        <div className="pointer-events-none absolute left-0 right-0 top-1">
+        <div className="absolute left-0 right-0 top-1">
           <div
-            className="flex flex-col items-center text-[11px] text-white"
-            style={{ left: playheadX, position: "absolute", transform: "translateX(-50%)" }}
+            className="pointer-events-none flex flex-col items-center text-[11px] text-white"
+            style={{ left: playheadX + TRACK_INSET_PX, position: "absolute", transform: "translateX(-50%)" }}
           >
             <button
               type="button"
@@ -677,6 +681,10 @@ export function TimelineRenderer({
             </button>
             <button
               type="button"
+              onMouseDown={(event) => {
+                event.stopPropagation();
+                event.preventDefault();
+              }}
               onClick={(event) => {
                 event.stopPropagation();
                 onCut();

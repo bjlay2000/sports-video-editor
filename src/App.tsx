@@ -13,6 +13,7 @@ import { PlayerSelectModal } from "./components/scoring/PlayerSelectModal";
 import { HighlightExportModal } from "./components/scoring/HighlightExportModal";
 import { ExportStatsModal } from "./components/scoring/ExportStatsModal.tsx";
 import { AddPlayerModal } from "./components/scoring/AddPlayerModal";
+import { CustomTitleBar } from "./components/system/CustomTitleBar";
 import { ToastHost } from "./components/system/ToastHost";
 import { ExportProgressModal } from "./components/export/ExportProgressModal";
 import { DatabaseService } from "./services/DatabaseService";
@@ -91,6 +92,7 @@ export default function App() {
 
   return (
     <div className="flex flex-col h-screen w-screen bg-surface">
+      <CustomTitleBar />
       <Toolbar />
       <PanelGroup direction="vertical" className="flex-1">
         <Panel defaultSize={65} minSize={30}>

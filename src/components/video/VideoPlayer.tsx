@@ -7,6 +7,7 @@ import {
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
 } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { videoEngine } from "../../services/VideoEngine";
 import { useVideoStore } from "../../store/videoStore";
 import { useTimelineStore } from "../../store/timelineStore";
@@ -57,6 +58,7 @@ export function VideoPlayer() {
   const setSelectedOverlayIds = useVideoStore((s) => s.setSelectedOverlayIds);
   const clearOverlaySelection = useVideoStore((s) => s.clearOverlaySelection);
   const setPlayheadTime = useTimelineStore((s) => s.setPlayheadTime);
+  const segments = useTimelineStore((s) => s.segments);
   const plays = useAppStore((s) => s.plays);
   const opponentScoreEvents = useAppStore((s) => s.opponentScoreEvents);
   const homeScoreEvents = useAppStore((s) => s.homeScoreEvents);
@@ -190,6 +192,19 @@ export function VideoPlayer() {
     return () => window.removeEventListener("pointerdown", handleGlobalPointerDown);
   }, [clearOverlaySelection, isInteractiveElement]);
 
+  useEffect(() => {
+    const preventFileDropNavigation = (event: DragEvent) => {
+      event.preventDefault();
+    };
+
+    window.addEventListener("dragover", preventFileDropNavigation);
+    window.addEventListener("drop", preventFileDropNavigation);
+    return () => {
+      window.removeEventListener("dragover", preventFileDropNavigation);
+      window.removeEventListener("drop", preventFileDropNavigation);
+    };
+  }, []);
+
   const handlePlayPause = useCallback(async () => {
     const element = videoRef.current;
     if (!element) return;
@@ -219,20 +234,81 @@ export function VideoPlayer() {
   const handlePlay = () => setIsPlaying(true);
   const handlePause = () => setIsPlaying(false);
 
+  const isInsideStage = useCallback((x: number, y: number) => {
+    const rect = stageRef.current?.getBoundingClientRect();
+    if (!rect) return true;
+    return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+  }, []);
+
+  const loadDroppedVideoPath = useCallback(async (videoPath: string) => {
+    try {
+      await MediaLibrary.loadClipFromPath(videoPath);
+    } catch (err) {
+      console.error("Failed to load dropped video", err);
+    }
+  }, []);
+
+  const isVideoPath = useCallback((filePath: string) => {
+    return /\.(mp4|mov|mkv|webm|avi|m4v)$/i.test(filePath);
+  }, []);
+
+  const normalizeDroppedPath = useCallback((value: string) => {
+    const trimmed = value.trim();
+    if (!trimmed) return "";
+    if (trimmed.startsWith("file://")) {
+      try {
+        const parsed = decodeURIComponent(new URL(trimmed).pathname);
+        return parsed.replace(/^\//, "");
+      } catch {
+        return trimmed;
+      }
+    }
+    return trimmed;
+  }, []);
+
+  const extractDroppedVideoPath = useCallback((e: React.DragEvent) => {
+    const directPath = Array.from(e.dataTransfer.files)
+      .map((file) => ((file as unknown as { path?: string }).path ?? "").trim())
+      .find((path) => Boolean(path && isVideoPath(path)));
+    if (directPath) return directPath;
+
+    const uriList = e.dataTransfer.getData("text/uri-list");
+    if (uriList) {
+      const fromUriList = uriList
+        .split(/\r?\n/)
+        .map((entry) => normalizeDroppedPath(entry))
+        .find((path) => Boolean(path && isVideoPath(path)));
+      if (fromUriList) return fromUriList;
+    }
+
+    const plainText = e.dataTransfer.getData("text/plain");
+    if (plainText) {
+      const fromText = plainText
+        .split(/\r?\n/)
+        .map((entry) => normalizeDroppedPath(entry))
+        .find((path) => Boolean(path && isVideoPath(path)));
+      if (fromText) return fromText;
+    }
+
+    return null;
+  }, [isVideoPath, normalizeDroppedPath]);
+
   const handleDrop = useCallback(async (e: React.DragEvent) => {
     e.preventDefault();
     setIsDropping(false);
-    const files = Array.from(e.dataTransfer.files);
-    for (const file of files) {
-      const path = (file as any).path as string | undefined;
-      if (!path) continue;
-      try {
-        await MediaLibrary.loadClipFromPath(path);
-      } catch (err) {
-        console.error(err);
-      }
+    const firstVideoPath = extractDroppedVideoPath(e);
+
+    if (!firstVideoPath) {
+      return;
     }
-  }, []);
+
+    await loadDroppedVideoPath(firstVideoPath);
+  }, [extractDroppedVideoPath, loadDroppedVideoPath]);
+
+  const handleDragEnter = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDropping(true);
+  };
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
@@ -244,6 +320,56 @@ export function VideoPlayer() {
       setIsDropping(false);
     }
   };
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+
+    getCurrentWindow()
+      .onDragDropEvent(async (event) => {
+        const payload = event.payload;
+        if (payload.type === "leave") {
+          setIsDropping(false);
+          return;
+        }
+
+        if (payload.type === "enter" || payload.type === "over") {
+          const scale = window.devicePixelRatio || 1;
+          const x = payload.position.x / scale;
+          const y = payload.position.y / scale;
+          setIsDropping(isInsideStage(x, y));
+          return;
+        }
+
+        if (payload.type === "drop") {
+          setIsDropping(false);
+          const scale = window.devicePixelRatio || 1;
+          const x = payload.position.x / scale;
+          const y = payload.position.y / scale;
+          if (!isInsideStage(x, y)) {
+            return;
+          }
+
+          const firstVideoPath = payload.paths.find((path) => isVideoPath(path));
+          if (!firstVideoPath) {
+            return;
+          }
+
+          await loadDroppedVideoPath(firstVideoPath);
+        }
+      })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch((error) => {
+        console.error("Failed to register native drag/drop listener", error);
+      });
+
+    return () => {
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [isInsideStage, isVideoPath, loadDroppedVideoPath]);
 
   const handleStepForward = () => {
     videoEngine.stepForward();
@@ -265,6 +391,47 @@ export function VideoPlayer() {
       .toString()
       .padStart(2, "0")}:${frames.toString().padStart(2, "0")}`;
   };
+
+  const sourceToProject = useCallback(
+    (sourceTime: number) => {
+      if (!segments.length || duration <= 0) {
+        return Math.max(0, Math.min(sourceTime, duration || 0));
+      }
+
+      let accum = 0;
+      for (const segment of segments) {
+        const segDuration = Math.max(0, segment.end - segment.start);
+        if (segDuration <= 0) continue;
+        if (sourceTime < segment.start) {
+          return accum;
+        }
+        if (sourceTime <= segment.end) {
+          return accum + (sourceTime - segment.start);
+        }
+        accum += segDuration;
+      }
+      return accum;
+    },
+    [segments, duration]
+  );
+
+  const projectDuration = useMemo(() => {
+    if (!segments.length) {
+      return duration;
+    }
+    return segments.reduce(
+      (total, segment) => total + Math.max(0, segment.end - segment.start),
+      0
+    );
+  }, [segments, duration]);
+
+  const projectCurrentTime = useMemo(() => {
+    if (duration <= 0) {
+      return 0;
+    }
+    const total = projectDuration || duration;
+    return Math.min(total, sourceToProject(currentTime));
+  }, [currentTime, duration, projectDuration, sourceToProject]);
 
   const handlePanStart = (e: ReactPointerEvent) => {
     const target = e.target as HTMLElement | null;
@@ -566,6 +733,7 @@ export function VideoPlayer() {
       ref={containerRef}
       className="h-full flex flex-col bg-surface-dark"
       onDrop={handleDrop}
+      onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
     >
@@ -602,6 +770,10 @@ export function VideoPlayer() {
           ref={stageRef}
           className="flex-1 relative overflow-hidden bg-black"
           data-video-stage
+          onDrop={handleDrop}
+          onDragEnter={handleDragEnter}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
           onPointerDown={handlePanStart}
           onPointerMove={handlePanMove}
           onPointerUp={handlePanEnd}
@@ -825,7 +997,7 @@ export function VideoPlayer() {
           ⏭
         </button>
         <span className="text-xs text-gray-400 font-mono ml-2">
-          {formatTime(currentTime)}
+          {formatTime(projectCurrentTime)} / {formatTime(projectDuration)}
         </span>
       </div>
       {selectedTextOverlay && (

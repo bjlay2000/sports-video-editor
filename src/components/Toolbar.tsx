@@ -551,7 +551,7 @@ export function Toolbar() {
 
   return (
     <>
-      <div className="h-12 bg-surface-dark border-b border-panel-border flex items-center px-4 gap-3 shrink-0">
+      <div className="h-14 bg-surface-dark border-b border-panel-border flex items-center px-4 gap-3 shrink-0">
         <span className="text-accent font-bold text-lg mr-4">SVE</span>
 
       <button

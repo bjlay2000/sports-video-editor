@@ -1819,6 +1819,46 @@ mod commands {
         result
     }
 
+    #[tauri::command]
+    pub fn open_file_path(path: String) -> Result<(), String> {
+        #[cfg(target_os = "windows")]
+        {
+            std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("start")
+                .arg("")
+                .arg(&path)
+                .status()
+                .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = path;
+            Err("open_file_path is currently implemented for Windows only".to_string())
+        }
+    }
+
+    #[tauri::command]
+    pub fn reveal_file_in_folder(path: String) -> Result<(), String> {
+        #[cfg(target_os = "windows")]
+        {
+            std::process::Command::new("explorer")
+                .arg("/select,")
+                .arg(&path)
+                .status()
+                .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = path;
+            Err("reveal_file_in_folder is currently implemented for Windows only".to_string())
+        }
+    }
+
 }
 
 fn main() {
@@ -1833,6 +1873,14 @@ fn main() {
             if let Err(err) = open_rosters_db(&app.handle()) {
                 eprintln!("[startup] failed to open rosters db: {}", err);
                 return Err(std::io::Error::new(std::io::ErrorKind::Other, err).into());
+            }
+
+            let icon = tauri::include_image!("icons/icon.png");
+
+            if let Some(main_window) = app.get_webview_window("main") {
+                if let Err(err) = main_window.set_icon(icon) {
+                    eprintln!("[startup] failed to set main window icon: {}", err);
+                }
             }
             Ok(())
         })
@@ -1875,7 +1923,9 @@ fn main() {
             commands::delete_roster,
             commands::get_rosters,
             commands::get_roster_players,
-            commands::save_roster_players
+            commands::save_roster_players,
+            commands::open_file_path,
+            commands::reveal_file_in_folder
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
